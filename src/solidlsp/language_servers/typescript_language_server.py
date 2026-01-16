@@ -5,6 +5,7 @@ Provides TypeScript specific instantiation of the LanguageServer class. Contains
 import logging
 import os
 import pathlib
+import platform
 import shutil
 import threading
 from typing import Any, cast
@@ -149,7 +150,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             # Install typescript and typescript-language-server if not already installed or version mismatch
             tsserver_ls_dir = os.path.join(self._ls_resources_dir, "ts-lsp")
             tsserver_executable_path = os.path.join(tsserver_ls_dir, "node_modules", ".bin", "typescript-language-server")
-            if os.name == "nt":
+            if platform.system() == "Windows":
                 tsserver_executable_path += ".cmd"
 
             # Check if installation is needed based on executable AND version
