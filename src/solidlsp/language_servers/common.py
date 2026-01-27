@@ -104,10 +104,8 @@ class RuntimeDependencyCollection:
 
             kwargs["user"] = pwd.getpwuid(os.getuid()).pw_name  # type: ignore
 
-        is_windows = platform.system() == "Windows"
-        if not isinstance(command, str) and not is_windows:
+        if not isinstance(command, str):
             # Since we are using the shell, we need to convert the command list to a single string
-            # on Linux/macOS
             command = " ".join(command)
 
         log.info("Running command %s in '%s'", f"'{command}'" if isinstance(command, str) else command, cwd)
@@ -117,6 +115,7 @@ class RuntimeDependencyCollection:
             shell=True,
             check=True,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             **kwargs,
