@@ -11,7 +11,6 @@ from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
 from test.conftest import get_repo_path, start_ls_context
 
-
 log = logging.getLogger(__name__)
 
 
@@ -32,9 +31,7 @@ class TestMultiLanguageSymbolRetrieval:
         with start_ls_context(Language.PYTHON, python_repo) as python_ls:
             with start_ls_context(Language.TYPESCRIPT, typescript_repo) as typescript_ls:
                 # Create a LanguageServerManager with both servers
-                ls_manager = LanguageServerManager(
-                    {Language.PYTHON: python_ls, Language.TYPESCRIPT: typescript_ls}
-                )
+                ls_manager = LanguageServerManager({Language.PYTHON: python_ls, Language.TYPESCRIPT: typescript_ls})
 
                 symbol_retriever = LanguageServerSymbolRetriever(ls_manager)
 
@@ -46,12 +43,15 @@ class TestMultiLanguageSymbolRetrieval:
                     with patch.object(typescript_ls, "request_full_symbol_tree", typescript_mock):
                         # Find symbols in a Python file
                         # This should only call request_full_symbol_tree on Python LS
-                        symbol_retriever.find("UserService", within_relative_path="test_repo/services.py")
+                        python_symbols = symbol_retriever.find("UserService", within_relative_path="test_repo/services.py")
 
                         # Verify Python LS was called
                         assert python_mock.call_count == 1, "Python LS should be called for .py file"
                         # Verify TypeScript LS was NOT called
                         assert typescript_mock.call_count == 0, "TypeScript LS should NOT be called for .py file"
+                        # Verify that we got valid symbols from Python file
+                        assert len(python_symbols) > 0, "Should find symbols in Python file"
+                        assert any("UserService" in s.name for s in python_symbols), "Should find UserService symbol"
 
                         # Reset mocks
                         python_mock.reset_mock()
@@ -59,12 +59,15 @@ class TestMultiLanguageSymbolRetrieval:
 
                         # Now find symbols in a TypeScript file
                         # This should only call request_full_symbol_tree on TypeScript LS
-                        symbol_retriever.find("helper", within_relative_path="index.ts")
+                        ts_symbols = symbol_retriever.find("helper", within_relative_path="index.ts")
 
                         # Verify TypeScript LS was called
                         assert typescript_mock.call_count == 1, "TypeScript LS should be called for .ts file"
                         # Verify Python LS was NOT called
                         assert python_mock.call_count == 0, "Python LS should NOT be called for .ts file"
+                        # Verify that we got valid symbols from TypeScript file
+                        # (may be 0 if no matching symbols, but should not error)
+                        assert isinstance(ts_symbols, list), "Should return a list of symbols"
 
     def test_find_symbol_with_directory_path_queries_all_ls(self):
         """
@@ -78,9 +81,7 @@ class TestMultiLanguageSymbolRetrieval:
         with start_ls_context(Language.PYTHON, python_repo) as python_ls:
             with start_ls_context(Language.TYPESCRIPT, typescript_repo) as typescript_ls:
                 # Create a LanguageServerManager with both servers
-                ls_manager = LanguageServerManager(
-                    {Language.PYTHON: python_ls, Language.TYPESCRIPT: typescript_ls}
-                )
+                ls_manager = LanguageServerManager({Language.PYTHON: python_ls, Language.TYPESCRIPT: typescript_ls})
 
                 symbol_retriever = LanguageServerSymbolRetriever(ls_manager)
 

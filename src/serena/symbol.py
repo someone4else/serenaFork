@@ -552,7 +552,13 @@ class LanguageServerSymbolRetriever:
 
         # When within_relative_path points to a file, only query language servers that support that file type
         if within_relative_path is not None:
-            abs_path = os.path.join(self.get_root_path(), within_relative_path)
+            abs_path = os.path.abspath(os.path.join(self.get_root_path(), within_relative_path))
+            root_path = os.path.abspath(self.get_root_path())
+
+            # Ensure the path is within the root directory (prevent path traversal)
+            if not abs_path.startswith(root_path + os.sep) and abs_path != root_path:
+                raise ValueError(f"Path {within_relative_path} is outside the project root")
+
             if os.path.isfile(abs_path):
                 # For a specific file, only use the language server that handles this file type
                 lang_server = self.get_language_server(within_relative_path)
