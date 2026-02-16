@@ -549,6 +549,26 @@ class LanguageServerSymbolRetriever:
         optionally limited to a specific file and filtered by kind.
         """
         symbols: list[LanguageServerSymbol] = []
+
+        # When within_relative_path points to a file, only query language servers that support that file type
+        if within_relative_path is not None:
+            abs_path = os.path.join(self.get_root_path(), within_relative_path)
+            if os.path.isfile(abs_path):
+                # For a specific file, only use the language server that handles this file type
+                lang_server = self.get_language_server(within_relative_path)
+                symbol_roots = lang_server.request_full_symbol_tree(within_relative_path=within_relative_path)
+                for root in symbol_roots:
+                    symbols.extend(
+                        LanguageServerSymbol(root).find(
+                            name_path_pattern,
+                            include_kinds=include_kinds,
+                            exclude_kinds=exclude_kinds,
+                            substring_matching=substring_matching,
+                        )
+                    )
+                return symbols
+
+        # For directories or no path specified, query all language servers
         for lang_server in self._ls_manager.iter_language_servers():
             symbol_roots = lang_server.request_full_symbol_tree(within_relative_path=within_relative_path)
             for root in symbol_roots:
