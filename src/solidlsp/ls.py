@@ -1212,7 +1212,7 @@ class SolidLanguageServer(ABC):
                 raise FileNotFoundError(f"File or directory not found: {within_abs_path}")
             if os.path.isfile(within_abs_path):
                 if self.is_ignored_path(within_relative_path):
-                    log.error("You passed a file explicitly, but it is ignored. This is probably an error. File: %s", within_relative_path)
+                    log.debug("You passed a file explicitly, but it is ignored. This is probably an error. File: %s", within_relative_path)
                     return []
                 else:
                     root_nodes = self.request_document_symbols(within_relative_path).root_symbols
