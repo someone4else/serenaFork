@@ -21,7 +21,6 @@ from .project import Project
 log = logging.getLogger(__name__)
 NAME_PATH_SEP = "/"
 
-
 @dataclass
 class LanguageServerSymbolLocation:
     """
@@ -30,16 +29,16 @@ class LanguageServerSymbolLocation:
 
     relative_path: str | None
     """
-    the relative path of the file containing the symbol; if None, the symbol is defined outside of the project's scope
+the relative path of the file containing the symbol; if None, the symbol is defined outside of the project's scope
     """
     line: int | None
     """
-    the line number in which the symbol identifier is defined (if the symbol is a function, class, etc.);
+the line number in which the symbol identifier is defined (if the symbol is a function, class, etc.);
     may be None for some types of symbols (e.g. SymbolKind.File)
     """
     column: int | None
     """
-    the column number in which the symbol identifier is defined (if the symbol is a function, class, etc.);
+the column number in which the symbol identifier is defined (if the symbol is a function, class, etc.);
     may be None for some types of symbols (e.g. SymbolKind.File)
     """
 
@@ -56,7 +55,6 @@ class LanguageServerSymbolLocation:
     def has_position_in_file(self) -> bool:
         return self.relative_path is not None and self.line is not None and self.column is not None
 
-
 @dataclass
 class PositionInFile:
     """
@@ -65,11 +63,11 @@ class PositionInFile:
 
     line: int
     """
-    the 0-based line number in the file
+the 0-based line number in the file
     """
     col: int
     """
-    the 0-based column
+the 0-based column
     """
 
     def to_lsp_position(self) -> Position:
@@ -77,7 +75,6 @@ class PositionInFile:
         Convert to LSP Position.
         """
         return Position(line=self.line, character=self.col)
-
 
 class Symbol(ToStringMixin, ABC):
     @abstractmethod
@@ -113,7 +110,6 @@ class Symbol(ToStringMixin, ABC):
             previous/next definition by at least one empty line.
         """
 
-
 class NamePathComponent:
     def __init__(self, name: str, overload_idx: int | None = None) -> None:
         self.name = name
@@ -124,7 +120,6 @@ class NamePathComponent:
             return f"{self.name}[{self.overload_idx}]"
         else:
             return self.name
-
 
 class NamePathMatcher(ToStringMixin):
     """
@@ -201,7 +196,6 @@ class NamePathMatcher(ToStringMixin):
             except StopIteration:
                 pass
         return True
-
 
 class LanguageServerSymbol(Symbol, ToStringMixin):
     def __init__(self, symbol_root_from_ls: UnifiedSymbolInformation) -> None:
@@ -501,7 +495,6 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
 
         return result
 
-
 @dataclass
 class ReferenceInLanguageServerSymbol(ToStringMixin):
     """
@@ -513,15 +506,15 @@ class ReferenceInLanguageServerSymbol(ToStringMixin):
 
     symbol: LanguageServerSymbol
     """
-    the symbol within which the reference is located
+the symbol within which the reference is located
     """
     line: int
     """
-    the line number in which the reference is located (0-based)
+the line number in which the reference is located (0-based)
     """
     character: int
     """
-    the column number in which the reference is located (0-based)
+the column number in which the reference is located (0-based)
     """
 
     @classmethod
@@ -530,7 +523,6 @@ class ReferenceInLanguageServerSymbol(ToStringMixin):
 
     def get_relative_path(self) -> str | None:
         return self.symbol.location.relative_path
-
 
 class LanguageServerSymbolRetriever:
     def __init__(self, project: Project) -> None:
@@ -671,10 +663,9 @@ class LanguageServerSymbolRetriever:
             budget_exceeded = skipped_due_to_budget > 0
 
             log.debug(
-                f"perf: request_info_for_symbols {total_elapsed_ms=:.2f} {total_symbols=} {skipped_symbols=} "
-                f"{total_hover_lookups=} {hover_cache_hits=} {unique_files=} "
-                f"{symbol_info_budget_seconds=:.1f} {hover_spent_seconds=:.2f} {budget_exceeded=} {skipped_due_to_budget=}"
-            )
+                f"perf: request_info_for_symbols {total_elapsed_ms=:.2f} {total_symbols=} {skipped_symbols=} \
+                {total_hover_lookups=} {hover_cache_hits=} {unique_files=} \
+                {symbol_info_budget_seconds=:.1f} {hover_spent_seconds=:.2f} {budget_exceeded=} {skipped_due_to_budget=}"            )
 
             for file_path, lookup_count, elapsed_ms in per_file_stats:
                 log.debug(f"perf: {file_path=} {lookup_count=} {elapsed_ms=:.2f}")
@@ -704,8 +695,8 @@ class LanguageServerSymbolRetriever:
 
         # When within_relative_path points to a file, only query language servers that support that file type
         if within_relative_path is not None:
-            abs_path = os.path.abspath(os.path.join(self.get_root_path(), within_relative_path))
-            root_path = os.path.abspath(self.get_root_path())
+            abs_path = os.path.abspath(os.path.join(self.project.project_root, within_relative_path))
+            root_path = os.path.abspath(self.project.project_root)
 
             # Ensure the path is within the root directory (prevent path traversal)
             if not abs_path.startswith(root_path + os.sep) and abs_path != root_path:
@@ -765,8 +756,8 @@ class LanguageServerSymbolRetriever:
             # otherwise, raise an error
             include_rel_path = within_relative_path is not None
             raise ValueError(
-                f"Found multiple {len(symbol_candidates)} symbols matching '{name_path_pattern}'. "
-                "They are: \n" + json.dumps([s.to_dict(kind=True, relative_path=include_rel_path) for s in symbol_candidates], indent=2)
+                f"Found multiple {len(symbol_candidates)} symbols matching '{name_path_pattern}'. \
+                They are: \n" + json.dumps([s.to_dict(kind=True, relative_path=include_rel_path) for s in symbol_candidates], indent=2)
             )
 
     def find_by_location(self, location: LanguageServerSymbolLocation) -> LanguageServerSymbol | None:
@@ -860,7 +851,6 @@ class LanguageServerSymbolRetriever:
         path_to_unified_symbols = lang_server.request_overview(relative_path)
         return {k: [LanguageServerSymbol(us) for us in v] for k, v in path_to_unified_symbols.items()}
 
-
 class JetBrainsSymbol(Symbol):
     def __init__(self, symbol_dict: jb.SymbolDTO, project: Project) -> None:
         """
@@ -916,10 +906,8 @@ class JetBrainsSymbol(Symbol):
         # NOTE: Symbol types cannot really be differentiated, because types are not handled in a language-agnostic way.
         return False
 
-
 TSymbolDict = TypeVar("TSymbolDict")
 GroupedSymbolDict = dict[str, list[dict] | dict[str, dict]]
-
 
 class SymbolDictGrouper(Generic[TSymbolDict], ABC):
     """
@@ -930,8 +918,7 @@ class SymbolDictGrouper(Generic[TSymbolDict], ABC):
     The respective ValueError will immediately be apparent.
     """
 
-    def __init__(
-        self,
+    def __init__(self,
         symbol_dict_type: type[TSymbolDict],
         children_key: Any,
         group_keys: list[Any],
@@ -1009,20 +996,16 @@ class SymbolDictGrouper(Generic[TSymbolDict], ABC):
         """
         return self._group_by(symbols, self._group_keys, self._group_children_keys)  # type: ignore
 
-
 class LanguageServerSymbolDictGrouper(SymbolDictGrouper[LanguageServerSymbol.OutputDict]):
-    def __init__(
-        self,
+    def __init__(self,
         group_keys: list[LanguageServerSymbol.OutputDictKey],
         group_children_keys: list[LanguageServerSymbol.OutputDictKey],
         collapse_singleton: bool = False,
     ) -> None:
         super().__init__(LanguageServerSymbol.OutputDict, "children", group_keys, group_children_keys, collapse_singleton)
 
-
 class JetBrainsSymbolDictGrouper(SymbolDictGrouper[jb.SymbolDTO]):
-    def __init__(
-        self,
+    def __init__(self,
         group_keys: list[jb.SymbolDTOKey],
         group_children_keys: list[jb.SymbolDTOKey],
         collapse_singleton: bool = False,
