@@ -2,7 +2,6 @@ import logging
 import os
 import pathlib
 import subprocess
-import threading
 from typing import Any, cast
 
 from overrides import override
@@ -95,7 +94,6 @@ class Gopls(SolidLanguageServer):
         self._setup_runtime_dependency()
 
         super().__init__(config, repository_root_path, ProcessLaunchInfo(cmd="gopls", cwd=repository_root_path), "go", solidlsp_settings)
-        self.server_ready = threading.Event()
         self.request_id = 0
 
     def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
@@ -167,7 +165,7 @@ class Gopls(SolidLanguageServer):
     _CACHE_CONTEXT_ENV_KEYS = ("GOFLAGS", "GOOS", "GOARCH", "CGO_ENABLED")
 
     @override
-    def _cache_context_fingerprint(self) -> str | None:
+    def _document_symbols_cache_fingerprint(self) -> str | None:
         """
         Compute a deterministic fingerprint of the Go build context.
 
@@ -234,8 +232,6 @@ class Gopls(SolidLanguageServer):
         assert "definitionProvider" in init_response["capabilities"]
 
         self.server.notify.initialized({})
-        self.completions_available.set()
 
         # gopls server is typically ready immediately after initialization
-        self.server_ready.set()
-        self.server_ready.wait()
+        # (no need to wait for events)

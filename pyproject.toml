@@ -54,14 +54,14 @@ text = "MIT"
 
 [project.optional-dependencies]
 dev = [
-  "black[jupyter]>=23.7.0",
+  "black[jupyter]>=23.7.0, <26",  # black 26 is incompatible with our pathspec version
   "jinja2",
   # In version 1.0.4 we get a NoneType error related to some config conversion (yml_analytics is None and should be a list)
   "mypy>=1.16.1",
   "poethepoet>=0.20.0",
   "pytest>=8.0.2",
   "pytest-xdist>=3.5.0",
-  "ruff>=0.0.285",
+  "ruff==0.12.5",
   "toml-sort>=0.24.2",
   "types-pyyaml>=6.0.12.20241230",
   "syrupy>=4.9.1",
@@ -114,7 +114,11 @@ warn_redundant_casts = true
 warn_unreachable = true
 warn_unused_configs = true
 warn_unused_ignores = false
-exclude = "^build/|^docs/"
+exclude = "^build/|^docs/|^test/resources/"
+
+[[tool.mypy.overrides]]
+module = "test.*"
+disallow_untyped_defs = false  # untyped defs are OK in tests
 
 [tool.poe.env]
 PYDEVD_DISABLE_FILE_VALIDATION = "1"
@@ -137,8 +141,9 @@ _black_format = "black src scripts test"
 _ruff_format = "ruff check --fix src scripts test"
 lint = ["_black_check", "_ruff_check"]
 format = ["_ruff_format", "_black_format"]
-_mypy = "mypy src/serena src/solidlsp"
-type-check = ["_mypy"]
+_mypy_core = "mypy src/serena src/solidlsp"
+_mypy_test = "mypy --disable-error-code no-untyped-def test"
+type-check = ["_mypy_core", "_mypy_test"]
 # docs
 _autogen_rst = "python docs/autogen_rst.py"
 _sphinx_build = "sphinx-build -b html docs docs/_build -W --keep-going"
@@ -263,6 +268,9 @@ ignore = [
   "UP037",    # can incorrectly (!) convert quoted type to unquoted type, causing an error
   "UP045",    # imposes T | None instead of Optional[T]
   "UP031",    # forbids % operator to format strings
+  "UP042",    # wants str,Enum -> StrEnum (breaking change)
+  "PLW0108",  # unnecessary lambda (style preference)
+  "PLC0207",  # split vs rsplit optimization (style preference)
 ]
 unfixable = ["F841", "F601", "F602", "B018"]
 extend-fixable = ["F401", "B905", "W291"]
@@ -299,9 +307,11 @@ markers = [
   "ruby: language server running for Ruby (uses ruby-lsp)",
   "zig: language server running for Zig",
   "lua: language server running for Lua",
+  "luau: language server running for Luau",
   "nix: language server running for Nix",
   "dart: language server running for Dart",
   "erlang: language server running for Erlang",
+  "ocaml: language server running for OCaml and Reason",
   "scala: language server running for Scala",
   "al: language server running for AL (Microsoft Dynamics 365 Business Central)",
   "fsharp: language server running for F#",
@@ -313,14 +323,18 @@ markers = [
   "yaml: language server running for YAML",
   "powershell: language server running for PowerShell",
   "pascal: language server running for Pascal (Free Pascal/Lazarus)",
+  "cpp: language server running for C/C++",
   "slow: tests that require additional Expert instances and have long startup times (~60-90s each)",
   "toml: language server running for TOML",
   "matlab: language server running for MATLAB (requires MATLAB R2021b+)",
+  "systemverilog: language server running for SystemVerilog (uses verible-verilog-ls)",
+  "hlsl: language server running for HLSL shaders (uses shader-language-server)",
+  "lean4: language server running for Lean 4",
 ]
 
 [tool.codespell]
 # Ref: https://github.com/codespell-project/codespell#using-a-config-file
 skip = '.git*,*.svg,*.lock,*.min.*'
 check-hidden = true
-# ignore-regex = ''
+ignore-regex = '\.\w+'
 ignore-words-list = 'paket'

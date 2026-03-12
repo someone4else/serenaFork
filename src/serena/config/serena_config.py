@@ -4,11 +4,12 @@ The Serena Model Context Protocol (MCP) Server
 
 import dataclasses
 import os
+import re
 import shutil
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
@@ -22,19 +23,21 @@ from sensai.util.string import ToStringMixin
 
 from serena.constants import (
     DEFAULT_SOURCE_FILE_ENCODING,
+    PROJECT_LOCAL_TEMPLATE_FILE,
     PROJECT_TEMPLATE_FILE,
     REPO_ROOT,
     SERENA_CONFIG_TEMPLATE_FILE,
     SERENA_FILE_ENCODING,
     SERENA_MANAGED_DIR_NAME,
 )
-from serena.util.general import get_dataclass_default, load_yaml, save_yaml
 from serena.util.inspection import determine_programming_language_composition
+from serena.util.yaml import YamlCommentNormalisation, load_yaml, normalise_yaml_comments, save_yaml, transfer_missing_yaml_comments
 from solidlsp.ls_config import Language
 
 from ..analytics import RegisteredTokenCountEstimator
 from ..util.class_decorators import singleton
 from ..util.cli_util import ask_yes_no
+from ..util.dataclass import get_dataclass_default
 
 if TYPE_CHECKING:
     from ..project import Project
@@ -84,6 +87,17 @@ class SerenaPaths:
         """
         file containing the ID of the last read news snippet
         """
+        global_memories_path = Path(os.path.join(self.serena_user_home_dir, "memories", "global"))
+        global_memories_path.mkdir(parents=True, exist_ok=True)
+        self.global_memories_path = global_memories_path
+        """
+        directory where global memories are stored, i.e. memories that are available across all projects
+        """
+        self.last_returned_log_file_path: str | None = None
+        """
+        the path to the last log file returned by `get_next_log_file_path`. If this is not None, the logs
+        are currently being written to this file
+        """
 
     def get_next_log_file_path(self, prefix: str) -> str:
         """
@@ -92,7 +106,8 @@ class SerenaPaths:
         """
         log_dir = os.path.join(self.serena_user_home_dir, "logs", datetime.now().strftime("%Y-%m-%d"))
         os.makedirs(log_dir, exist_ok=True)
-        return os.path.join(log_dir, prefix + "_" + datetime_tag() + ".txt")
+        self.last_returned_log_file_path = os.path.join(log_dir, prefix + "_" + datetime_tag() + f"_{os.getpid()}" + ".txt")
+        return self.last_returned_log_file_path
 
     # TODO: Paths from constants.py should be moved here
 
@@ -127,12 +142,18 @@ class ToolInclusionDefinition:
         return num_fixed > 0
 
 
-class SerenaConfigError(Exception):
-    pass
+@dataclass
+class NamedToolInclusionDefinition(ToolInclusionDefinition):
+    name: str | None = None
+
+    def __str__(self) -> str:
+        return f"ToolInclusionDefinition[{self.name}]"
 
 
-def get_serena_managed_in_project_dir(project_root: str | Path) -> str:
-    return os.path.join(project_root, SERENA_MANAGED_DIR_NAME)
+@dataclass
+class ModeSelectionDefinition:
+    base_modes: Sequence[str] | None = None
+    default_modes: Sequence[str] | None = None
 
 
 class LanguageBackend(Enum):
@@ -154,9 +175,68 @@ class LanguageBackend(Enum):
                 return backend
         raise ValueError(f"Unknown language backend '{backend_str}': valid values are {[b.value for b in LanguageBackend]}")
 
+    def is_lsp(self) -> bool:
+        return self == LanguageBackend.LSP
+
+    def is_jetbrains(self) -> bool:
+        return self == LanguageBackend.JETBRAINS
+
+
+class LineEnding(Enum):
+    """Line ending convention for file writes."""
+
+    LF = "lf"
+    CRLF = "crlf"
+    NATIVE = "native"
+
+    @property
+    def newline_str(self) -> str | None:
+        """The newline parameter value for :func:`open` and :meth:`Path.write_text`.
+
+        Returns ``None`` for native mode (platform default).
+        """
+        if self is LineEnding.LF:
+            return "\n"
+        elif self is LineEnding.CRLF:
+            return "\r\n"
+        return None
+
+    @classmethod
+    def from_str(cls, value: str) -> "LineEnding":
+        """Parse a string value into a :class:`LineEnding`."""
+        try:
+            return cls(value.lower())
+        except ValueError as e:
+            valid = [le.value for le in cls]
+            raise ValueError(f"Invalid line_ending: {value!r}. Valid values are: {valid}") from e
+
+
+@dataclass
+class SharedConfig(ModeSelectionDefinition, ToolInclusionDefinition, ToStringMixin):
+    """Shared between SerenaConfig and ProjectConfig, the latter used to override values in the form
+    (same as in ModeSelectionDefinition).
+    The defaults here shall be none and should be set to the global default values in SerenaConfig.
+    """
+
+    symbol_info_budget: float | None = None
+    language_backend: LanguageBackend | None = None
+    line_ending: LineEnding | None = None
+    read_only_memory_patterns: list[str] = field(default_factory=list)
+
+
+class SerenaConfigError(Exception):
+    pass
+
+
+DEFAULT_PROJECT_SERENA_FOLDER_LOCATION = "$projectDir/" + SERENA_MANAGED_DIR_NAME
+"""
+The default template for the project Serena folder location.
+Uses $projectDir and $projectFolderName as placeholders.
+"""
+
 
 @dataclass(kw_only=True)
-class ProjectConfig(ToolInclusionDefinition, ToStringMixin):
+class ProjectConfig(SharedConfig):
     project_name: str
     languages: list[Language]
     ignored_paths: list[str] = field(default_factory=list)
@@ -165,7 +245,14 @@ class ProjectConfig(ToolInclusionDefinition, ToStringMixin):
     initial_prompt: str = ""
     encoding: str = DEFAULT_SOURCE_FILE_ENCODING
 
-    SERENA_DEFAULT_PROJECT_FILE = "project.yml"
+    SERENA_PROJECT_FILE = "project.yml"
+    SERENA_LOCAL_PROJECT_FILE = "project.local.yml"
+    FIELDS_WITHOUT_DEFAULTS = {"project_name", "languages"}
+    YAML_COMMENT_NORMALISATION = YamlCommentNormalisation.LEADING
+    """
+    the comment normalisation strategy to use when loading/saving project configuration files.
+    The template file must match this configuration (i.e. it must use leading comments if this is set to LEADING).
+    """
 
     def _tostring_includes(self) -> list[str]:
         return ["project_name"]
@@ -174,6 +261,7 @@ class ProjectConfig(ToolInclusionDefinition, ToStringMixin):
     def autogenerate(
         cls,
         project_root: str | Path,
+        serena_config: "SerenaConfig",
         project_name: str | None = None,
         languages: list[Language] | None = None,
         save_to_disk: bool = True,
@@ -183,6 +271,7 @@ class ProjectConfig(ToolInclusionDefinition, ToStringMixin):
         Autogenerate a project configuration for a given project root.
 
         :param project_root: the path to the project root
+        :param serena_config: the global Serena configuration
         :param project_name: the name of the project; if None, the name of the project will be the name of the directory
             containing the project
         :param languages: the languages of the project; if None, they will be determined automatically
@@ -195,99 +284,105 @@ class ProjectConfig(ToolInclusionDefinition, ToStringMixin):
             raise FileNotFoundError(f"Project root not found: {project_root}")
         with LogTime("Project configuration auto-generation", logger=log):
             log.info("Project root: %s", project_root)
-            project_name = project_name or project_root.name
+            project_folder_name = project_root.name
+            project_name = project_name or project_folder_name
             if languages is None:
                 # determine languages automatically
                 log.info("Determining programming languages used in the project")
                 language_composition = determine_programming_language_composition(str(project_root))
                 log.info("Language composition: %s", language_composition)
                 if len(language_composition) == 0:
-                    language_values = ", ".join([lang.value for lang in Language])
-                    raise ValueError(
-                        f"No source files found in {project_root}\n\n"
-                        f"To use Serena with this project, you need to either\n"
-                        f"  1. specify a programming language by adding parameters --language <language>\n"
-                        f"     when creating the project via the Serena CLI command OR\n"
-                        f"  2. add source files in one of the supported languages first.\n\n"
-                        f"Supported languages are: {language_values}\n"
-                        f"Read the documentation for more information."
+                    log.warning(
+                        "No source files for supported language servers were found in %s. "
+                        "Creating project with no configured languages. "
+                        "Symbol-related tools (e.g. find_symbol, get_symbols_overview) will not work "
+                        "when using the LSP backend. You can add languages later via the Serena dashboard "
+                        "or by manually editing the project configuration.",
+                        project_root,
                     )
-                # sort languages by number of files found
-                languages_and_percentages = sorted(
-                    language_composition.items(), key=lambda item: (item[1], item[0].get_priority()), reverse=True
-                )
-                # find the language with the highest percentage and enable it
-                top_language_pair = languages_and_percentages[0]
-                other_language_pairs = languages_and_percentages[1:]
-                languages_to_use: list[str] = [top_language_pair[0].value]
-                # if in interactive mode, ask the user which other languages to enable
-                if len(other_language_pairs) > 0 and interactive:
-                    print(
-                        "Detected and enabled main language '%s' (%.2f%% of source files)."
-                        % (top_language_pair[0].value, top_language_pair[1])
+                    languages_to_use: list[str] = []
+                else:
+                    # sort languages by number of files found
+                    languages_and_percentages = sorted(
+                        language_composition.items(), key=lambda item: (item[1], item[0].get_priority()), reverse=True
                     )
-                    print(f"Additionally detected {len(other_language_pairs)} other language(s).\n")
-                    print("Note: Enable only languages you need symbolic retrieval/editing capabilities for.")
-                    print("      Additional language servers use resources and some languages may require additional")
-                    print("      system-level installations/configuration (see Serena documentation).")
-                    print("\nWhich additional languages do you want to enable?")
-                    for lang, perc in other_language_pairs:
-                        enable = ask_yes_no("Enable %s (%.2f%% of source files)?" % (lang.value, perc), default=False)
-                        if enable:
-                            languages_to_use.append(lang.value)
-                    print()
+                    # find the language with the highest percentage and enable it
+                    top_language_pair = languages_and_percentages[0]
+                    other_language_pairs = languages_and_percentages[1:]
+                    languages_to_use = [top_language_pair[0].value]
+                    # if in interactive mode, ask the user which other languages to enable
+                    if len(other_language_pairs) > 0 and interactive:
+                        print(
+                            "Detected and enabled main language '%s' (%.2f%% of source files)."
+                            % (top_language_pair[0].value, top_language_pair[1])
+                        )
+                        print(f"Additionally detected {len(other_language_pairs)} other language(s).\n")
+                        print("Note: Enable only languages you need symbolic retrieval/editing capabilities for.")
+                        print("      Additional language servers use resources and some languages may require additional")
+                        print("      system-level installations/configuration (see Serena documentation).")
+                        print("\nWhich additional languages do you want to enable?")
+                        for lang, perc in other_language_pairs:
+                            enable = ask_yes_no("Enable %s (%.2f%% of source files)?" % (lang.value, perc), default=False)
+                            if enable:
+                                languages_to_use.append(lang.value)
+                        print()
                 log.info("Using languages: %s", languages_to_use)
             else:
                 languages_to_use = [lang.value for lang in languages]
-            config_with_comments = cls.load_commented_map(PROJECT_TEMPLATE_FILE)
+            config_with_comments, _ = cls._load_yaml_dict(PROJECT_TEMPLATE_FILE)
             config_with_comments["project_name"] = project_name
             config_with_comments["languages"] = languages_to_use
+
             if save_to_disk:
-                project_yml_path = cls.path_to_project_yml(project_root)
+                project_yml_path = serena_config.get_project_yml_location(str(project_root))
                 log.info("Saving project configuration to %s", project_yml_path)
-                save_yaml(project_yml_path, config_with_comments, preserve_comments=True)
+                save_yaml(project_yml_path, config_with_comments)
+                project_local_yml_path = os.path.join(os.path.dirname(project_yml_path), cls.SERENA_LOCAL_PROJECT_FILE)
+                shutil.copy(PROJECT_LOCAL_TEMPLATE_FILE, project_local_yml_path)
             return cls._from_dict(config_with_comments)
 
     @classmethod
-    def path_to_project_yml(cls, project_root: str | Path) -> str:
-        return os.path.join(project_root, cls.rel_path_to_project_yml())
+    def default_project_yml_path(cls, project_root: str | Path) -> str:
+        """
+        :return: the default path to the project.yml file (inside ``$projectDir/.serena/``).
+            This is suitable as a fallback when no ``SerenaConfig`` is available to resolve
+            a potentially customised location.
+        """
+        return os.path.join(str(project_root), SERENA_MANAGED_DIR_NAME, cls.SERENA_PROJECT_FILE)
 
     @classmethod
-    def rel_path_to_project_yml(cls) -> str:
-        return os.path.join(SERENA_MANAGED_DIR_NAME, cls.SERENA_DEFAULT_PROJECT_FILE)
-
-    @classmethod
-    def _apply_defaults_to_dict(cls, data: TDict) -> TDict:
-        # apply defaults for new fields
-        data["languages"] = data.get("languages", [])
-        data["ignored_paths"] = data.get("ignored_paths", [])
-        data["excluded_tools"] = data.get("excluded_tools", [])
-        data["included_optional_tools"] = data.get("included_optional_tools", [])
-        data["read_only"] = data.get("read_only", False)
-        data["ignore_all_files_in_gitignore"] = data.get("ignore_all_files_in_gitignore", True)
-        data["initial_prompt"] = data.get("initial_prompt", "")
-        data["encoding"] = data.get("encoding", DEFAULT_SOURCE_FILE_ENCODING)
-
-        # backward compatibility: handle single "language" field
-        if len(data["languages"]) == 0 and "language" in data:
-            data["languages"] = [data["language"]]
-        if "language" in data:
-            del data["language"]
-
-        return data
-
-    @classmethod
-    def load_commented_map(cls, yml_path: str) -> CommentedMap:
+    def _load_yaml_dict(
+        cls, yml_path: str, comment_normalisation: YamlCommentNormalisation = YamlCommentNormalisation.NONE
+    ) -> tuple[CommentedMap, bool]:
         """
         Load the project configuration as a CommentedMap, preserving comments and ensuring
         completeness of the configuration by applying default values for missing fields
         and backward compatibility adjustments.
 
         :param yml_path: the path to the project.yml file
-        :return: a CommentedMap representing a full project configuration
+        :return: a tuple `(dict, was_complete)` where dict is a CommentedMap representing a
+          full project configuration and `was_complete` indicates whether the loaded configuration
+          was complete (i.e., did not require any default values to be applied)
         """
-        data = load_yaml(yml_path, preserve_comments=True)
-        return cls._apply_defaults_to_dict(data)
+        data = load_yaml(yml_path, comment_normalisation=comment_normalisation)
+
+        # apply defaults
+        was_complete = True
+        for field_info in dataclasses.fields(cls):
+            key = field_info.name
+            if key in cls.FIELDS_WITHOUT_DEFAULTS:
+                continue
+            if key not in data:
+                was_complete = False
+                default_value = get_dataclass_default(cls, key)
+                data.setdefault(key, default_value)
+
+        # backward compatibility: handle single "language" field
+        if "languages" not in data and "language" in data:
+            data["languages"] = [data["language"]]
+            del data["language"]
+
+        return data, was_complete
 
     @classmethod
     def _from_dict(cls, data: dict[str, Any]) -> Self:
@@ -309,51 +404,120 @@ class ProjectConfig(ToolInclusionDefinition, ToStringMixin):
                     f"Invalid language: {orig_language_str}.\nValid language_strings are: {[l.value for l in Language]}"
                 ) from e
 
+        # Validate symbol_info_budget
+        symbol_info_budget_raw = data["symbol_info_budget"]
+        symbol_info_budget = symbol_info_budget_raw
+        if symbol_info_budget is not None:
+            try:
+                symbol_info_budget = float(symbol_info_budget_raw)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"symbol_info_budget must be a number or null, got: {symbol_info_budget_raw}") from e
+            if symbol_info_budget < 0:
+                raise ValueError(f"symbol_info_budget cannot be negative, got: {symbol_info_budget}")
+
+        language_backend_value = data.get("language_backend")
+        language_backend = LanguageBackend.from_str(language_backend_value) if language_backend_value else None
+
+        line_ending_value = data.get("line_ending")
+        line_ending = LineEnding.from_str(line_ending_value) if line_ending_value else None
+
         return cls(
             project_name=data["project_name"],
             languages=languages,
             ignored_paths=data["ignored_paths"],
             excluded_tools=data["excluded_tools"],
+            fixed_tools=data["fixed_tools"],
             included_optional_tools=data["included_optional_tools"],
             read_only=data["read_only"],
+            read_only_memory_patterns=data.get("read_only_memory_patterns", []),
             ignore_all_files_in_gitignore=data["ignore_all_files_in_gitignore"],
             initial_prompt=data["initial_prompt"],
             encoding=data["encoding"],
+            line_ending=line_ending,
+            language_backend=language_backend,
+            base_modes=data["base_modes"],
+            default_modes=data["default_modes"],
+            symbol_info_budget=symbol_info_budget,
         )
 
-    def to_yaml_dict(self) -> dict:
+    def _to_yaml_dict(self) -> dict:
         """
         :return: a yaml-serializable dictionary representation of this configuration
         """
         d = dataclasses.asdict(self)
         d["languages"] = [lang.value for lang in self.languages]
+        d["language_backend"] = self.language_backend.value if self.language_backend is not None else None
+        d["line_ending"] = self.line_ending.value if self.line_ending is not None else None
         return d
 
     @classmethod
-    def load(cls, project_root: Path | str, autogenerate: bool = False) -> Self:
+    def load(cls, project_root: Path | str, serena_config: "SerenaConfig", autogenerate: bool = False) -> Self:
         """
         Load a ProjectConfig instance from the path to the project root.
+
+        :param project_root: the path to the project root
+        :param serena_config: the global Serena configuration
+        :param autogenerate: whether to auto-generate the configuration if it does not exist
         """
         project_root = Path(project_root)
-        yaml_path = project_root / cls.rel_path_to_project_yml()
-        if not yaml_path.exists():
+        project_folder_name = project_root.name
+        yaml_path = serena_config.get_project_yml_location(project_root)
+
+        # auto-generate if necessary
+        if not os.path.exists(yaml_path):
             if autogenerate:
-                return cls.autogenerate(project_root)
+                return cls.autogenerate(project_root, serena_config)
             else:
                 raise FileNotFoundError(f"Project configuration file not found: {yaml_path}")
-        yaml_data = cls.load_commented_map(str(yaml_path))
+
+        # load the configuration dictionary
+        yaml_data, was_complete = cls._load_yaml_dict(str(yaml_path))
         if "project_name" not in yaml_data:
-            yaml_data["project_name"] = project_root.name
-        return cls._from_dict(yaml_data)
+            yaml_data["project_name"] = project_folder_name
+
+        # instantiate the ProjectConfig
+        project_config = cls._from_dict(yaml_data)
+
+        # if the configuration was incomplete, re-save it to disk
+        if not was_complete:
+            log.info("Project configuration in %s was incomplete, re-saving with default values for missing fields", yaml_path)
+            project_config.save(str(yaml_path))
+
+        return project_config
+
+    def save(self, project_yml_path: str) -> None:
+        """
+        Saves the project configuration to disk.
+
+        :param project_yml_path: the path to the project.yml file
+        """
+        config_path = project_yml_path
+        log.info("Saving updated project configuration to %s", config_path)
+
+        # load original commented map and update it with current values
+        config_with_comments, _ = self._load_yaml_dict(config_path, self.YAML_COMMENT_NORMALISATION)
+        config_with_comments.update(self._to_yaml_dict())
+
+        # transfer missing comments from the template file
+        template_config, _ = self._load_yaml_dict(PROJECT_TEMPLATE_FILE, self.YAML_COMMENT_NORMALISATION)
+        transfer_missing_yaml_comments(template_config, config_with_comments, self.YAML_COMMENT_NORMALISATION)
+
+        save_yaml(config_path, config_with_comments)
 
 
 class RegisteredProject(ToStringMixin):
-    def __init__(self, project_root: str, project_config: "ProjectConfig", project_instance: Optional["Project"] = None) -> None:
+    def __init__(
+        self,
+        project_root: str,
+        project_config: "ProjectConfig",
+        project_instance: Optional["Project"] = None,
+    ) -> None:
         """
         Represents a registered project in the Serena configuration.
 
         :param project_root: the root directory of the project
         :param project_config: the configuration of the project
+        :param project_instance: an existing project instance (if already loaded)
         """
         self.project_root = Path(project_root).resolve()
         self.project_config = project_config
@@ -374,6 +538,14 @@ class RegisteredProject(ToStringMixin):
             project_instance=project_instance,
         )
 
+    @classmethod
+    def from_project_root(cls, project_root: str | Path, serena_config: "SerenaConfig") -> "RegisteredProject":
+        project_config = ProjectConfig.load(project_root, serena_config=serena_config)
+        return RegisteredProject(
+            project_root=str(project_root),
+            project_config=project_config,
+        )
+
     def matches_root_path(self, path: str | Path) -> bool:
         """
         Check if the given path matches the project root path.
@@ -381,9 +553,9 @@ class RegisteredProject(ToStringMixin):
         :param path: the path to check
         :return: True if the path matches the project root, False otherwise
         """
-        return self.project_root == Path(path).resolve()
+        return self.project_root.samefile(Path(path).resolve())
 
-    def get_project_instance(self) -> "Project":
+    def get_project_instance(self, serena_config: "SerenaConfig") -> "Project":
         """
         Returns the project instance for this registered project, loading it if necessary.
         """
@@ -391,37 +563,33 @@ class RegisteredProject(ToStringMixin):
             from ..project import Project
 
             with LogTime(f"Loading project instance for {self}", logger=log):
-                self._project_instance = Project(project_root=str(self.project_root), project_config=self.project_config)
+                self._project_instance = Project(
+                    project_root=str(self.project_root),
+                    project_config=self.project_config,
+                    serena_config=serena_config,
+                )
         return self._project_instance
 
 
 @dataclass(kw_only=True)
-class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
+class SerenaConfig(SharedConfig):
     """
     Holds the Serena agent configuration, which is typically loaded from a YAML configuration file
     (when instantiated via :method:`from_config_file`), which is updated when projects are added or removed.
     For testing purposes, it can also be instantiated directly with the desired parameters.
     """
 
+    # *** fields that are mapped directly to/from the configuration file (DO NOT RENAME) ***
+
     projects: list[RegisteredProject] = field(default_factory=list)
-    gui_log_window_enabled: bool = False
+    gui_log_window: bool = False
     log_level: int = logging.INFO
     trace_lsp_communication: bool = False
     web_dashboard: bool = True
     web_dashboard_open_on_launch: bool = True
     web_dashboard_listen_address: str = "127.0.0.1"
+    jetbrains_plugin_server_address: str = "127.0.0.1"
     tool_timeout: float = DEFAULT_TOOL_TIMEOUT
-    loaded_commented_yaml: CommentedMap | None = None
-    config_file_path: str | None = None
-    """
-    the path to the configuration file to which updates of the configuration shall be saved;
-    if None, the configuration is not saved to disk
-    """
-
-    language_backend: LanguageBackend = LanguageBackend.LSP
-    """
-    the language backend to use for code understanding features
-    """
 
     token_count_estimator: str = RegisteredTokenCountEstimator.CHAR_COUNT.name
     """Only relevant if `record_tool_usage` is True; the name of the token count estimator to use for tool usage statistics.
@@ -439,7 +607,77 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
     ls_specific_settings: dict = field(default_factory=dict)
     """Advanced configuration option allowing to configure language server implementation specific options, see SolidLSPSettings for more info."""
 
+    ignored_paths: list[str] = field(default_factory=list)
+    """List of paths to ignore across all projects. Same syntax as gitignore, so you can use * and **.
+    These patterns are merged additively with each project's own ignored_paths."""
+
+    project_serena_folder_location: str = DEFAULT_PROJECT_SERENA_FOLDER_LOCATION
+    """
+    Template for the location of the per-project .serena data folder (memories, caches, etc.).
+    Supports the following placeholders:
+      - $projectDir: the absolute path to the project root directory
+      - $projectFolderName: the name of the project folder
+    Examples:
+      - "$projectDir/.serena" (default, stores data inside the project)
+      - "/projects-metadata/$projectFolderName/.serena" (stores data in a central location)
+    """
+
+    # settings with overridden defaults
+    language_backend: LanguageBackend = LanguageBackend.LSP
+    """
+    the language backend to use for code understanding features
+    """
+    default_modes: Sequence[str] | None = ("interactive", "editing")
+    line_ending: LineEnding = LineEnding.NATIVE
+    symbol_info_budget: float = 10.0
+    """
+    Time budget (seconds) for requests when tools request include_info (currently
+    only supported for LSP-based tools).
+
+    If the budget is exceeded, Serena stops issuing further requests and returns partial info results.
+    0 disables the budget (no early stopping). Negative values are invalid.
+    """
+    # *** fields that are NOT mapped to/from the configuration file ***
+
+    _loaded_commented_yaml: CommentedMap | None = None
+    _config_file_path: str | None = None
+    """
+    the path to the configuration file to which updates of the configuration shall be saved;
+    if None, the configuration is not saved to disk
+    """
+
+    # *** static members ***
+
     CONFIG_FILE = "serena_config.yml"
+    CONFIG_FIELDS_WITH_TYPE_CONVERSION = {"projects", "language_backend", "line_ending"}
+
+    # *** methods ***
+    @classmethod
+    def get_config_file_creation_date(cls) -> datetime | None:
+        """
+        :return: the creation date of the configuration file, or None if the configuration file does not exist
+        """
+        config_file_path = cls._determine_config_file_path()
+        if not os.path.exists(config_file_path):
+            return None
+
+        # for unix systems st_ctime is the inode change time (change of metadata),
+        # which is good enough for our purposes
+        creation_timestamp = os.stat(config_file_path).st_ctime
+        return datetime.fromtimestamp(creation_timestamp, UTC)
+
+    @property
+    def config_file_path(self) -> str | None:
+        return self._config_file_path
+
+    def _iter_config_file_mapped_fields_without_type_conversion(self) -> Iterator[str]:
+        for field_info in dataclasses.fields(self):
+            field_name = field_info.name
+            if field_name.startswith("_"):
+                continue
+            if field_name in self.CONFIG_FIELDS_WITH_TYPE_CONVERSION:
+                continue
+            yield field_name
 
     def _tostring_includes(self) -> list[str]:
         return ["config_file_path"]
@@ -452,8 +690,8 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
         :param config_file_path: the path where the configuration file should be generated
         """
         log.info(f"Auto-generating Serena configuration file in {config_file_path}")
-        loaded_commented_yaml = load_yaml(SERENA_CONFIG_TEMPLATE_FILE, preserve_comments=True)
-        save_yaml(config_file_path, loaded_commented_yaml, preserve_comments=True)
+        loaded_commented_yaml = load_yaml(SERENA_CONFIG_TEMPLATE_FILE)
+        save_yaml(config_file_path, loaded_commented_yaml)
 
     @classmethod
     def _determine_config_file_path(cls) -> str:
@@ -489,41 +727,45 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
         # load the configuration
         log.info(f"Loading Serena configuration from {config_file_path}")
         try:
-            loaded_commented_yaml = load_yaml(config_file_path, preserve_comments=True)
+            loaded_commented_yaml = load_yaml(config_file_path)
         except Exception as e:
             raise ValueError(f"Error loading Serena configuration from {config_file_path}: {e}") from e
 
         # create the configuration instance
-        instance = cls(loaded_commented_yaml=loaded_commented_yaml, config_file_path=config_file_path)
+        instance = cls(_loaded_commented_yaml=loaded_commented_yaml, _config_file_path=config_file_path)
+        num_migrations = 0
+
+        def get_value_or_default(field_name: str) -> Any:
+            nonlocal num_migrations
+            if field_name not in loaded_commented_yaml:
+                num_migrations += 1
+            return loaded_commented_yaml.get(field_name, get_dataclass_default(SerenaConfig, field_name))
+
+        # transfer regular fields that do not require type conversion
+        for field_name in instance._iter_config_file_mapped_fields_without_type_conversion():
+            assert hasattr(instance, field_name)
+            setattr(instance, field_name, get_value_or_default(field_name))
 
         # read projects
         if "projects" not in loaded_commented_yaml:
             raise SerenaConfigError("`projects` key not found in Serena configuration. Please update your `serena_config.yml` file.")
-
-        # load list of known projects
         instance.projects = []
-        num_migrations = 0
         for path in loaded_commented_yaml["projects"]:
             path = Path(path).resolve()
-            if not path.exists() or (path.is_dir() and not (path / ProjectConfig.rel_path_to_project_yml()).exists()):
-                log.warning(f"Project path {path} does not exist or does not contain a project configuration file, skipping.")
+            if not path.exists() or (path.is_dir() and not os.path.isfile(instance.get_project_yml_location(str(path)))):
+                log.warning(f"Project path {path} does not exist or no associated project configuration file found, skipping.")
                 continue
             if path.is_file():
                 path = cls._migrate_out_of_project_config_file(path)
                 if path is None:
                     continue
                 num_migrations += 1
-            project_config = ProjectConfig.load(path)
+            project_config = ProjectConfig.load(path, serena_config=instance)  # instance is sufficiently populated
             project = RegisteredProject(
                 project_root=str(path),
                 project_config=project_config,
             )
             instance.projects.append(project)
-
-        def get_value_or_default(key: str, field_name: str | None = None) -> Any:
-            if field_name is None:
-                field_name = key
-            return loaded_commented_yaml.get(key, get_dataclass_default(SerenaConfig, field_name))
 
         # determine language backend
         language_backend = get_dataclass_default(SerenaConfig, "language_backend")
@@ -539,19 +781,28 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
                 del loaded_commented_yaml["jetbrains"]
         instance.language_backend = language_backend
 
-        # set other configuration parameters (primitive types)
-        instance.gui_log_window_enabled = get_value_or_default("gui_log_window", "gui_log_window_enabled")
-        instance.web_dashboard_listen_address = get_value_or_default("web_dashboard_listen_address")
-        instance.log_level = loaded_commented_yaml.get("log_level", loaded_commented_yaml.get("gui_log_level", logging.INFO))
-        instance.web_dashboard = get_value_or_default("web_dashboard")
-        instance.web_dashboard_open_on_launch = get_value_or_default("web_dashboard_open_on_launch")
-        instance.tool_timeout = get_value_or_default("tool_timeout")
-        instance.trace_lsp_communication = get_value_or_default("trace_lsp_communication")
-        instance.excluded_tools = get_value_or_default("excluded_tools")
-        instance.included_optional_tools = get_value_or_default("included_optional_tools")
-        instance.token_count_estimator = get_value_or_default("token_count_estimator")
-        instance.default_max_tool_answer_chars = get_value_or_default("default_max_tool_answer_chars")
-        instance.ls_specific_settings = get_value_or_default("ls_specific_settings")
+        # determine line ending
+        line_ending_value = loaded_commented_yaml.get("line_ending")
+        if line_ending_value:
+            instance.line_ending = LineEnding.from_str(line_ending_value)
+        else:
+            num_migrations += 1
+            instance.line_ending = get_dataclass_default(SerenaConfig, "line_ending")
+
+        # migrate deprecated "gui_log_level" field if necessary
+        if "gui_log_level" in loaded_commented_yaml:
+            num_migrations += 1
+            if "log_level" not in loaded_commented_yaml:
+                instance.log_level = loaded_commented_yaml["gui_log_level"]
+            del loaded_commented_yaml["gui_log_level"]
+
+        # migrate "edit_global_memories"
+        if "edit_global_memories" in loaded_commented_yaml:
+            num_migrations += 1
+            edit_global_memories = loaded_commented_yaml["edit_global_memories"]
+            if not edit_global_memories:
+                instance.read_only_memory_patterns.append("global/.*")
+            del loaded_commented_yaml["edit_global_memories"]
 
         # re-save the configuration file if any migrations were performed
         if num_migrations > 0:
@@ -578,7 +829,7 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
                 with open(path, "a", encoding=SERENA_FILE_ENCODING) as f:
                     f.write(f"\nproject_name: {project_name}")
             project_root = project_config_data["project_root"]
-            shutil.move(str(path), str(Path(project_root) / ProjectConfig.rel_path_to_project_yml()))
+            shutil.move(str(path), ProjectConfig.default_project_yml_path(project_root))
             return Path(project_root).resolve()
         except Exception as e:
             log.error(f"Error migrating configuration file: {e}")
@@ -592,30 +843,58 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
     def project_names(self) -> list[str]:
         return sorted(project.project_config.project_name for project in self.projects)
 
-    def get_project(self, project_root_or_name: str) -> Optional["Project"]:
+    def get_registered_project(self, project_root_or_name: str, autoregister: bool = False) -> Optional[RegisteredProject]:
+        """
+        :param project_root_or_name: path to the project root or the name of the project
+        :param autoregister: whether to register the project if it exists but is not registered yet
+        :return: the registered project, or None if not found
+        """
         # look for project by name
         project_candidates = []
         for project in self.projects:
             if project.project_config.project_name == project_root_or_name:
                 project_candidates.append(project)
         if len(project_candidates) == 1:
-            return project_candidates[0].get_project_instance()
+            return project_candidates[0]
         elif len(project_candidates) > 1:
             raise ValueError(
-                f"Multiple projects found with name '{project_root_or_name}'. Please activate it by location instead. "
+                f"Multiple projects found with name '{project_root_or_name}'. Please reference it by location instead. "
                 f"Locations: {[p.project_root for p in project_candidates]}"
             )
         # no project found by name; check if it's a path
         if os.path.isdir(project_root_or_name):
             for project in self.projects:
                 if project.matches_root_path(project_root_or_name):
-                    return project.get_project_instance()
+                    return project
+        # no registered project found; auto-register if project configuration exists
+        if autoregister:
+            config_path = self.get_project_yml_location(project_root_or_name)
+            if os.path.isfile(config_path):
+                registered_project = RegisteredProject.from_project_root(project_root_or_name, serena_config=self)
+                self.add_registered_project(registered_project)
+                return registered_project
+        # nothing found
         return None
+
+    def get_project(self, project_root_or_name: str) -> Optional["Project"]:
+        registered_project = self.get_registered_project(project_root_or_name)
+        if registered_project is None:
+            return None
+        else:
+            return registered_project.get_project_instance(serena_config=self)
+
+    def add_registered_project(self, registered_project: RegisteredProject) -> None:
+        """
+        Adds a registered project, saving the configuration file.
+        """
+        self.projects.append(registered_project)
+        self.save()
 
     def add_project_from_path(self, project_root: Path | str) -> "Project":
         """
-        Add a project to the Serena configuration from a given path. Will raise a FileExistsError if a
-        project already exists at the path.
+        Add a new project to the Serena configuration from a given path, auto-generating the project
+        with defaults if it does not exist.
+        Will raise a FileExistsError if a project already exists at the path.
 
         :param project_root: the path to the project to add
         :return: the project that was added
@@ -634,11 +913,15 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
                     f"Project with path {project_root} was already added with name '{already_registered_project.project_name}'."
                 )
 
-        project_config = ProjectConfig.load(project_root, autogenerate=True)
+        project_config = ProjectConfig.load(project_root, serena_config=self, autogenerate=True)
 
-        new_project = Project(project_root=str(project_root), project_config=project_config, is_newly_created=True)
-        self.projects.append(RegisteredProject.from_project_instance(new_project))
-        self.save()
+        new_project = Project(
+            project_root=str(project_root),
+            project_config=project_config,
+            is_newly_created=True,
+            serena_config=self,
+        )
+        self.add_registered_project(RegisteredProject.from_project_instance(new_project))
 
         return new_project
 
@@ -659,14 +942,109 @@ class SerenaConfig(ToolInclusionDefinition, ToStringMixin):
         if self.config_file_path is None:
             return
 
-        assert self.loaded_commented_yaml is not None, "Cannot save configuration without loaded YAML"
+        assert self._loaded_commented_yaml is not None, "Cannot save configuration without loaded YAML"
 
-        loaded_original_yaml = deepcopy(self.loaded_commented_yaml)
+        commented_yaml = deepcopy(self._loaded_commented_yaml)
+
+        # update fields with current values
+        for field_name in self._iter_config_file_mapped_fields_without_type_conversion():
+            commented_yaml[field_name] = getattr(self, field_name)
 
         # convert project objects into list of paths
-        loaded_original_yaml["projects"] = sorted({str(project.project_root) for project in self.projects})
+        commented_yaml["projects"] = sorted({str(project.project_root) for project in self.projects})
 
         # convert language backend to string
-        loaded_original_yaml["language_backend"] = self.language_backend.value
+        commented_yaml["language_backend"] = self.language_backend.value
 
-        save_yaml(self.config_file_path, loaded_original_yaml, preserve_comments=True)
+        # convert line ending to string
+        commented_yaml["line_ending"] = self.line_ending.value
+
+        # transfer comments from the template file
+        # NOTE: The template file now uses leading comments, but we previously used trailing comments,
+        #       so we apply a conversion, which detects the old style and transforms it.
+        # For some keys, we force updates, because old comments are problematic/misleading.
+        normalise_yaml_comments(commented_yaml, YamlCommentNormalisation.LEADING_WITH_CONVERSION_FROM_TRAILING)
+        template_yaml = load_yaml(SERENA_CONFIG_TEMPLATE_FILE, comment_normalisation=YamlCommentNormalisation.LEADING)
+        transfer_missing_yaml_comments(template_yaml, commented_yaml, YamlCommentNormalisation.LEADING, forced_update_keys=["projects"])
+
+        save_yaml(self.config_file_path, commented_yaml)
+
+    @staticmethod
+    def _resolve_serena_folder_location(template: str, placeholders: dict[str, str]) -> str:
+        """
+        Resolves a folder location template by replacing known ``$placeholder`` tokens
+        and raising on any unrecognised ones.
+
+        :param template: the template string (e.g. ``"$projectDir/.serena"``)
+        :param placeholders: mapping from placeholder name (without ``$``) to replacement value
+        :return: the resolved absolute path
+        :raises SerenaConfigError: if the template contains an unknown ``$placeholder``
+        """
+
+        def _replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name not in placeholders:
+                raise SerenaConfigError(
+                    f"Unknown placeholder '${name}' in project_serena_folder_location. "
+                    f"Supported placeholders: {', '.join('$' + k for k in placeholders)}"
+                )
+            return placeholders[name]
+
+        result = re.sub(r"\$([A-Za-z_]\w*)", _replace, template)
+        return os.path.abspath(result)
+
+    def get_configured_project_serena_folder(self, project_root: str | Path) -> str:
+        """
+        Returns the resolved absolute path to the .serena data folder for a project,
+        applying placeholder substitution to ``project_serena_folder_location``
+        without any fallback logic.
+
+        :param project_root: the absolute path to the project root directory
+        :return: the resolved absolute path to the project's .serena folder
+        :raises SerenaConfigError: if the template contains an unknown placeholder
+        """
+        project_folder_name = Path(project_root).name
+        placeholders = {
+            "projectDir": str(project_root),
+            "projectFolderName": project_folder_name,
+        }
+        return self._resolve_serena_folder_location(self.project_serena_folder_location, placeholders)
+
+    def get_project_serena_folder(self, project_root: str | Path) -> str:
+        """
+        Resolves the location of the project's .serena data folder using fallback logic:
+
+        1. If the folder exists at the configured path (``project_serena_folder_location``), use it.
+        2. Otherwise, if it exists at the default location inside the project root, use that.
+        3. If neither exists, return the configured path (for creation).
+
+        :param project_root: the absolute path to the project root directory
+        :return: the resolved absolute path to the .serena data folder
+        :raises SerenaConfigError: if the configured template contains an unknown placeholder
+        """
+        configured_path = self.get_configured_project_serena_folder(project_root)
+        if os.path.isdir(configured_path):
+            return configured_path
+        default_path = os.path.join(str(project_root), SERENA_MANAGED_DIR_NAME)
+        if configured_path != default_path and os.path.isdir(default_path):
+            return default_path
+        return configured_path
+
+    def get_project_yml_location(self, project_root: str | Path) -> str:
+        """
+        Returns the resolved absolute path to the project.yml configuration file,
+        based on the resolved .serena data folder (with fallback logic).
+
+        :param project_root: the absolute path to the project root directory
+        :return: the resolved absolute path to the project's project.yml file
+        """
+        serena_folder = self.get_project_serena_folder(project_root)
+        return os.path.join(serena_folder, ProjectConfig.SERENA_PROJECT_FILE)
+
+    def propagate_settings(self) -> None:
+        """
+        Propagate settings from this configuration to individual components that are statically configured
+        """
+        from serena.tools import JetBrainsPluginClient
+
+        JetBrainsPluginClient.set_server_address(self.jetbrains_plugin_server_address)

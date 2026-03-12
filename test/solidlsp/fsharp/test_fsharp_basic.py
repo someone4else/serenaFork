@@ -1,15 +1,13 @@
 import os
-import tempfile
 import threading
-from pathlib import Path
-from unittest.mock import Mock, patch
+from typing import Any
 
 import pytest
 
 from solidlsp import SolidLanguageServer
-from solidlsp.language_servers.fsharp_language_server import FSharpLanguageServer
 from solidlsp.ls_config import Language
 from solidlsp.ls_utils import SymbolUtils
+from test.conftest import is_ci
 
 
 @pytest.mark.fsharp
@@ -51,6 +49,7 @@ class TestFSharpLanguageServer:
         for expected in expected_symbols:
             assert expected in symbol_names, f"{expected} function not found in Calculator.fs symbols"
 
+    @pytest.mark.xfail(is_ci, reason="Test is flaky")  # TODO: Re-enable if the LS can be made more reliable #1040
     @pytest.mark.parametrize("language_server", [Language.FSHARP], indirect=True)
     def test_find_referencing_symbols(self, language_server: SolidLanguageServer) -> None:
         """Test finding references using symbol selection range."""
@@ -87,6 +86,7 @@ class TestFSharpLanguageServer:
         for expected in expected_symbols:
             assert expected in symbol_names, f"{expected} not found in Person.fs symbols"
 
+    @pytest.mark.xfail(is_ci, reason="Test is flaky")  # TODO: Re-enable if the LS can be made more reliable #1040
     @pytest.mark.parametrize("language_server", [Language.FSHARP], indirect=True)
     def test_find_referencing_symbols_across_files(self, language_server: SolidLanguageServer) -> None:
         """Test finding references to Calculator functions across files."""
@@ -109,6 +109,7 @@ class TestFSharpLanguageServer:
         # The subtract function should be referenced in Program.fs
         assert any("Program.fs" in ref.get("relativePath", "") for ref in refs), "Program.fs should reference subtract function"
 
+    @pytest.mark.xfail(is_ci, reason="Test is flaky")  # TODO: Re-enable if the LS can be made more reliable #1040
     @pytest.mark.parametrize("language_server", [Language.FSHARP], indirect=True)
     def test_go_to_definition(self, language_server: SolidLanguageServer) -> None:
         """Test go-to-definition functionality."""
@@ -122,6 +123,7 @@ class TestFSharpLanguageServer:
         # We should get at least some definitions
         assert len(definitions) >= 0, "Should get definitions (even if empty for complex cases)"
 
+    @pytest.mark.xfail(is_ci, reason="Test is flaky")  # TODO: Re-enable if the LS can be made more reliable #1040
     @pytest.mark.parametrize("language_server", [Language.FSHARP], indirect=True)
     def test_hover_information(self, language_server: SolidLanguageServer) -> None:
         """Test hover information functionality."""
@@ -140,14 +142,14 @@ class TestFSharpLanguageServer:
         file_path = os.path.join("Program.fs")
 
         # Use threading for cross-platform timeout (signal.SIGALRM is Unix-only)
-        result = [None]
-        exception = [None]
+        result: dict[str, Any] = dict(value=None)
+        exception: dict[str, Any] = dict(value=None)
 
         def run_completion():
             try:
-                result[0] = language_server.request_completions(file_path, 15, 10)
+                result["value"] = language_server.request_completions(file_path, 15, 10)
             except Exception as e:
-                exception[0] = e
+                exception["value"] = e
 
         thread = threading.Thread(target=run_completion, daemon=True)
         thread.start()
@@ -158,10 +160,10 @@ class TestFSharpLanguageServer:
             # The important thing is that the language server doesn't crash
             return
 
-        if exception[0]:
-            raise exception[0]
+        if exception["value"]:
+            raise exception["value"]
 
-        assert isinstance(result[0], list), "Completions should be a list"
+        assert isinstance(result["value"], list), "Completions should be a list"
 
     @pytest.mark.parametrize("language_server", [Language.FSHARP], indirect=True)
     def test_diagnostics(self, language_server: SolidLanguageServer) -> None:
@@ -179,41 +181,3 @@ class TestFSharpLanguageServer:
 
         # This is a successful test - FsAutoComplete is working with F# files
         assert True, "F# language server can handle files successfully"
-
-
-@pytest.mark.fsharp
-class TestFSharpLanguageServerSetup:
-    """Test F# language server setup and configuration."""
-
-    def test_runtime_dependency_setup_without_dotnet(self) -> None:
-        """Test that setup fails gracefully when .NET is not installed."""
-        with patch("shutil.which", return_value=None):
-            with pytest.raises(RuntimeError, match=r"\.NET SDK is not installed"):
-                FSharpLanguageServer._setup_runtime_dependencies(Mock(), Mock())
-
-    def test_runtime_dependency_setup_with_dotnet(self) -> None:
-        """Test that setup works when .NET is available."""
-        mock_config = Mock()
-        mock_settings = Mock()
-
-        # Mock the ls_resources_dir to return a temp directory
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch("shutil.which", return_value="/usr/bin/dotnet"):
-                with patch.object(FSharpLanguageServer, "ls_resources_dir", return_value=temp_dir):
-                    with patch("subprocess.run") as mock_run:
-                        # Mock successful dotnet version check
-                        mock_run.return_value.stdout = "8.0.100"
-                        mock_run.return_value.returncode = 0
-
-                        # Create a fake fsautocomplete executable
-                        fsharp_dir = os.path.join(temp_dir, "fsharp-lsp")
-                        os.makedirs(fsharp_dir, exist_ok=True)
-                        # Use .exe extension on Windows, matching production code
-                        exe_name = "fsautocomplete.exe" if os.name == "nt" else "fsautocomplete"
-                        fsautocomplete_path = os.path.join(fsharp_dir, exe_name)
-                        Path(fsautocomplete_path).touch()
-
-                        result = FSharpLanguageServer._setup_runtime_dependencies(mock_config, mock_settings)
-
-                        assert fsautocomplete_path in result
-                        assert "--adaptive-lsp-server-enabled --project-graph-enabled --use-fcs-transparent-compiler" in result

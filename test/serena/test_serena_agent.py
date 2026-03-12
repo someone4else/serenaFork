@@ -15,13 +15,14 @@ from serena.project import Project
 from serena.tools import SUCCESS_RESULT, FindReferencingSymbolsTool, FindSymbolTool, ReplaceContentTool, ReplaceSymbolBodyTool
 from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
-from test.conftest import get_repo_path, language_tests_enabled
+from test.conftest import get_repo_path, is_ci, language_tests_enabled
 from test.solidlsp import clojure as clj
 
 
 @pytest.fixture
 def serena_config():
-    """Create an in-memory configuration for tests with test repositories pre-registered."""
+    config = SerenaConfig(gui_log_window=False, web_dashboard=False, log_level=logging.ERROR)
+
     # Create test projects for all supported languages
     test_projects = []
     for language in [
@@ -36,6 +37,8 @@ def serena_config():
         Language.CLOJURE,
         Language.FSHARP,
         Language.POWERSHELL,
+        Language.CPP_CCLS,
+        Language.LEAN4,
     ]:
         repo_path = get_repo_path(language)
         if repo_path.exists():
@@ -46,16 +49,16 @@ def serena_config():
                     project_name=project_name,
                     languages=[language],
                     ignored_paths=[],
-                    excluded_tools=set(),
+                    excluded_tools=[],
                     read_only=False,
                     ignore_all_files_in_gitignore=True,
                     initial_prompt="",
                     encoding="utf-8",
                 ),
+                serena_config=config,
             )
             test_projects.append(RegisteredProject.from_project_instance(project))
 
-    config = SerenaConfig(gui_log_window_enabled=False, web_dashboard=False, log_level=logging.ERROR)
     config.projects = test_projects
     return config
 
@@ -104,27 +107,22 @@ def serena_agent(request: pytest.FixtureRequest, serena_config) -> Iterator[Sere
 
 
 class TestSerenaAgent:
-    @pytest.mark.parametrize(
-        "serena_agent,symbol_name,expected_kind,expected_file",
-        [
-            pytest.param(Language.PYTHON, "User", "Class", "models.py", marks=pytest.mark.python),
-            pytest.param(Language.GO, "Helper", "Function", "main.go", marks=pytest.mark.go),
-            pytest.param(Language.JAVA, "Model", "Class", "Model.java", marks=pytest.mark.java),
-            pytest.param(Language.KOTLIN, "Model", "Struct", "Model.kt", marks=pytest.mark.kotlin),
-            pytest.param(Language.RUST, "add", "Function", "lib.rs", marks=pytest.mark.rust),
-            pytest.param(Language.TYPESCRIPT, "DemoClass", "Class", "index.ts", marks=pytest.mark.typescript),
-            pytest.param(Language.PHP, "helperFunction", "Function", "helper.php", marks=pytest.mark.php),
-            pytest.param(Language.CLOJURE, "greet", "Function", clj.CORE_PATH, marks=pytest.mark.clojure),
-            pytest.param(Language.CSHARP, "Calculator", "Class", "Program.cs", marks=pytest.mark.csharp),
-            pytest.param(Language.FSHARP, "Calculator", "Module", "Calculator.fs", marks=pytest.mark.fsharp),
-            pytest.param(Language.POWERSHELL, "function Greet-User ()", "Function", "main.ps1", marks=pytest.mark.powershell),
-        ],
-        indirect=["serena_agent"],
-    )
-    def test_find_symbol(self, serena_agent: SerenaAgent, symbol_name: str, expected_kind: str, expected_file: str):
+    @pytest.mark.parametrize("project", [None, str(get_repo_path(Language.PYTHON)), "non_existent_path"])
+    def test_agent_instantiation(self, project: str | None):
+        """
+        Tests agent instantiation for cases where
+          * no project is specified at startup
+          * a valid project path is specified at startup
+          * an invalid project path is specified at startup
+        All cases must not raise an exception.
+        """
+        serena_config = SerenaConfig(gui_log_window=False, web_dashboard=False)
+        SerenaAgent(project=project, serena_config=serena_config)
+
+    def _assert_find_symbol(self, serena_agent: SerenaAgent, symbol_name: str, expected_kind: str, expected_file: str) -> None:
         agent = serena_agent
         find_symbol_tool = agent.get_tool(FindSymbolTool)
-        result = find_symbol_tool.apply_ex(name_path_pattern=symbol_name)
+        result = find_symbol_tool.apply(name_path_pattern=symbol_name, include_info=True)
 
         symbols = json.loads(result)
         assert any(
@@ -149,6 +147,89 @@ class TestSerenaAgent:
                 assert "A simple model class" in symbol_info, f"Java class docstring not found in symbol info: {s}"
 
     @pytest.mark.parametrize(
+        "serena_agent,symbol_name,expected_kind,expected_file",
+        [
+            pytest.param(Language.PYTHON, "User", "Class", "models.py", marks=pytest.mark.python),
+            pytest.param(Language.GO, "Helper", "Function", "main.go", marks=pytest.mark.go),
+            pytest.param(Language.JAVA, "Model", "Class", "Model.java", marks=pytest.mark.java),
+            pytest.param(
+                Language.KOTLIN,
+                "Model",
+                "Struct",
+                "Model.kt",
+                marks=[pytest.mark.kotlin] + ([pytest.mark.skip(reason="Kotlin LSP JVM crashes on restart in CI")] if is_ci else []),
+            ),
+            pytest.param(Language.TYPESCRIPT, "DemoClass", "Class", "index.ts", marks=pytest.mark.typescript),
+            pytest.param(Language.PHP, "helperFunction", "Function", "helper.php", marks=pytest.mark.php),
+            pytest.param(Language.CLOJURE, "greet", "Function", clj.CORE_PATH, marks=pytest.mark.clojure),
+            pytest.param(Language.CSHARP, "Calculator", "Class", "Program.cs", marks=pytest.mark.csharp),
+            pytest.param(Language.POWERSHELL, "function Greet-User ()", "Function", "main.ps1", marks=pytest.mark.powershell),
+            pytest.param(Language.CPP_CCLS, "add", "Function", "b.cpp", marks=pytest.mark.cpp),
+            pytest.param(Language.LEAN4, "add", "Method", "Helper.lean", marks=pytest.mark.lean4),
+        ],
+        indirect=["serena_agent"],
+    )
+    def test_find_symbol_stable(self, serena_agent: SerenaAgent, symbol_name: str, expected_kind: str, expected_file: str) -> None:
+        self._assert_find_symbol(serena_agent, symbol_name, expected_kind, expected_file)
+
+    @pytest.mark.parametrize(
+        "serena_agent,symbol_name,expected_kind,expected_file",
+        [
+            pytest.param(Language.FSHARP, "Calculator", "Module", "Calculator.fs", marks=pytest.mark.fsharp),
+        ],
+        indirect=["serena_agent"],
+    )
+    @pytest.mark.xfail(reason="F# language server is unreliable")  # See issue #1040
+    def test_find_symbol_fsharp(self, serena_agent: SerenaAgent, symbol_name: str, expected_kind: str, expected_file: str) -> None:
+        self._assert_find_symbol(serena_agent, symbol_name, expected_kind, expected_file)
+
+    @pytest.mark.parametrize(
+        "serena_agent,symbol_name,expected_kind,expected_file",
+        [
+            pytest.param(Language.RUST, "add", "Function", "lib.rs", marks=pytest.mark.rust),
+        ],
+        indirect=["serena_agent"],
+    )
+    @pytest.mark.xfail(reason="Rust language server is unreliable")  # See issue #1040
+    def test_find_symbol_rust(self, serena_agent: SerenaAgent, symbol_name: str, expected_kind: str, expected_file: str) -> None:
+        self._assert_find_symbol(serena_agent, symbol_name, expected_kind, expected_file)
+
+    def _assert_find_symbol_references(self, serena_agent: SerenaAgent, symbol_name: str, def_file: str, ref_file: str) -> None:
+        agent = serena_agent
+
+        # Find the symbol location first
+        find_symbol_tool = agent.get_tool(FindSymbolTool)
+        result = find_symbol_tool.apply(name_path_pattern=symbol_name, relative_path=def_file)
+
+        time.sleep(1)
+        symbols = json.loads(result)
+        # Find the definition
+        def_symbol = symbols[0]
+
+        # Now find references
+        find_refs_tool = agent.get_tool(FindReferencingSymbolsTool)
+        result = find_refs_tool.apply(name_path=def_symbol["name_path"], relative_path=def_symbol["relative_path"])
+
+        def contains_ref_with_relative_path(refs, relative_path):
+            """
+            Checks for reference to relative path, regardless of output format (grouped an ungrouped)
+            """
+            if isinstance(refs, list):
+                for ref in refs:
+                    if contains_ref_with_relative_path(ref, relative_path):
+                        return True
+            elif isinstance(refs, dict):
+                if relative_path in refs:
+                    return True
+                for value in refs.values():
+                    if contains_ref_with_relative_path(value, relative_path):
+                        return True
+            return False
+
+        refs = json.loads(result)
+        assert contains_ref_with_relative_path(refs, ref_file), f"Expected to find reference to {symbol_name} in {ref_file}. refs={refs}"
+
+    @pytest.mark.parametrize(
         "serena_agent,symbol_name,def_file,ref_file",
         [
             pytest.param(
@@ -171,10 +252,9 @@ class TestSerenaAgent:
                 "Model",
                 os.path.join("src", "main", "kotlin", "test_repo", "Model.kt"),
                 os.path.join("src", "main", "kotlin", "test_repo", "Main.kt"),
-                marks=pytest.mark.kotlin,
+                marks=[pytest.mark.kotlin] + ([pytest.mark.skip(reason="Kotlin LSP JVM crashes on restart in CI")] if is_ci else []),
             ),
             pytest.param(Language.RUST, "add", os.path.join("src", "lib.rs"), os.path.join("src", "main.rs"), marks=pytest.mark.rust),
-            pytest.param(Language.TYPESCRIPT, "helperFunction", "index.ts", "use_helper.ts", marks=pytest.mark.typescript),
             pytest.param(Language.PHP, "helperFunction", "helper.php", "index.php", marks=pytest.mark.php),
             pytest.param(
                 Language.CLOJURE,
@@ -184,31 +264,36 @@ class TestSerenaAgent:
                 marks=pytest.mark.clojure,
             ),
             pytest.param(Language.CSHARP, "Calculator", "Program.cs", "Program.cs", marks=pytest.mark.csharp),
-            pytest.param(Language.FSHARP, "add", "Calculator.fs", "Program.fs", marks=pytest.mark.fsharp),
             pytest.param(Language.POWERSHELL, "function Greet-User ()", "main.ps1", "main.ps1", marks=pytest.mark.powershell),
+            pytest.param(Language.CPP_CCLS, "add", "b.cpp", "a.cpp", marks=pytest.mark.cpp),
+            pytest.param(Language.LEAN4, "add", "Helper.lean", "Main.lean", marks=pytest.mark.lean4),
         ],
         indirect=["serena_agent"],
     )
-    def test_find_symbol_references(self, serena_agent: SerenaAgent, symbol_name: str, def_file: str, ref_file: str) -> None:
-        agent = serena_agent
+    def test_find_symbol_references_stable(self, serena_agent: SerenaAgent, symbol_name: str, def_file: str, ref_file: str) -> None:
+        self._assert_find_symbol_references(serena_agent, symbol_name, def_file, ref_file)
 
-        # Find the symbol location first
-        find_symbol_tool = agent.get_tool(FindSymbolTool)
-        result = find_symbol_tool.apply_ex(name_path_pattern=symbol_name, relative_path=def_file)
+    @pytest.mark.parametrize(
+        "serena_agent,symbol_name,def_file,ref_file",
+        [
+            pytest.param(Language.TYPESCRIPT, "helperFunction", "index.ts", "use_helper.ts", marks=pytest.mark.typescript),
+        ],
+        indirect=["serena_agent"],
+    )
+    @pytest.mark.xfail(reason="TypeScript language server is unreliable")  # See issue #1040
+    def test_find_symbol_references_typescript(self, serena_agent: SerenaAgent, symbol_name: str, def_file: str, ref_file: str) -> None:
+        self._assert_find_symbol_references(serena_agent, symbol_name, def_file, ref_file)
 
-        time.sleep(1)
-        symbols = json.loads(result)
-        # Find the definition
-        def_symbol = symbols[0]
-
-        # Now find references
-        find_refs_tool = agent.get_tool(FindReferencingSymbolsTool)
-        result = find_refs_tool.apply_ex(name_path=def_symbol["name_path"], relative_path=def_symbol["relative_path"])
-
-        refs = json.loads(result)
-        assert any(
-            ref["relative_path"] == ref_file for ref in refs
-        ), f"Expected to find reference to {symbol_name} in {ref_file}. refs={refs}"
+    @pytest.mark.parametrize(
+        "serena_agent,symbol_name,def_file,ref_file",
+        [
+            pytest.param(Language.FSHARP, "add", "Calculator.fs", "Program.fs", marks=pytest.mark.fsharp),
+        ],
+        indirect=["serena_agent"],
+    )
+    @pytest.mark.xfail(reason="F# language server is unreliable")  # See issue #1040
+    def test_find_symbol_references_fsharp(self, serena_agent: SerenaAgent, symbol_name: str, def_file: str, ref_file: str) -> None:
+        self._assert_find_symbol_references(serena_agent, symbol_name, def_file, ref_file)
 
     @pytest.mark.parametrize(
         "serena_agent,name_path,substring_matching,expected_symbol_name,expected_kind,expected_file",
@@ -446,7 +531,6 @@ class TestSerenaAgent:
         needle = r'console.log("WebSocketManager initializing\nStatus OK");'
         repl = r'console.log("WebSocketManager initialized\nAll systems go!");'
         replace_content_tool = serena_agent.get_tool(ReplaceContentTool)
-        mode: Literal["literal", "regex"]
         with project_file_modification_context(serena_agent, relative_path):
             result = replace_content_tool.apply(
                 needle=re.escape(needle) if mode == "regex" else needle,

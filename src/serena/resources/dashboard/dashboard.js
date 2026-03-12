@@ -52,8 +52,17 @@ function updateThemeAwareImage($img, theme=null) {
     }
 }
 
+/**
+ * Manages banner loading, display, and navigation.
+ *
+ * When automaticRotationEnabled is true, banners rotate on a timer and arrow
+ * buttons are hidden.  When false (the current default), a random initial
+ * banner is shown and the user navigates manually via arrow buttons.
+ */
 class BannerRotation {
     constructor() {
+        this.automaticRotationEnabled = false;
+
         this.platinumIndex = 0;
         this.goldIndex = 0;
         this.platinumTimer = null;
@@ -67,8 +76,18 @@ class BannerRotation {
     init() {
         let self = this;
         this.loadBanners(function() {
-            self.startPlatinumRotation();
-            self.startGoldRotation();
+            self.randomizeInitialBanner('platinum');
+            self.randomizeInitialBanner('gold');
+
+            if (self.automaticRotationEnabled) {
+                self.startPlatinumRotation();
+                self.startGoldRotation();
+                // Hide arrows entirely when rotation is automatic
+                $('.banner-arrow').hide();
+            } else {
+                self.hideArrowsIfSingle();
+                self.bindArrowButtons();
+            }
         });
     }
 
@@ -119,11 +138,52 @@ class BannerRotation {
         }, this.platinumInterval);
     }
 
+    randomizeInitialBanner(type) {
+        const slideClass = type === 'platinum' ? '.platinum-banner-slide' : '.gold-banner-slide';
+        const $slides = $(slideClass);
+        const total = $slides.length;
+
+        if (total === 0) return;
+
+        const randomIndex = Math.floor(Math.random() * total);
+        if (type === 'platinum') {
+            this.platinumIndex = randomIndex;
+        } else {
+            this.goldIndex = randomIndex;
+        }
+        $slides.removeClass('active');
+        $slides.eq(randomIndex).addClass('active');
+    }
+
     startGoldRotation() {
         const self = this;
         this.goldTimer = setInterval(() => {
             self.rotateGold('next');
         }, this.goldInterval);
+    }
+
+    hideArrowsIfSingle() {
+        if ($('.platinum-banner-slide').length <= 1) {
+            $('#platinum-banners .banner-arrow').hide();
+        }
+        if ($('.gold-banner-slide').length <= 1) {
+            $('#gold-banners .banner-arrow').hide();
+        }
+    }
+
+    bindArrowButtons() {
+        let self = this;
+        $('.banner-arrow').on('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const target = $(this).data('target');
+            const direction = $(this).hasClass('banner-arrow-right') ? 'next' : 'prev';
+            if (target === 'platinum') {
+                self.rotatePlatinum(direction);
+            } else {
+                self.rotateGold(direction);
+            }
+        });
     }
 
     rotatePlatinum(direction) {
@@ -145,9 +205,11 @@ class BannerRotation {
         // Add active class to new slide
         $slides.eq(this.platinumIndex).addClass('active');
 
-        // Reset timer
-        clearInterval(this.platinumTimer);
-        this.startPlatinumRotation();
+        // Reset timer when in automatic rotation mode
+        if (this.automaticRotationEnabled) {
+            clearInterval(this.platinumTimer);
+            this.startPlatinumRotation();
+        }
     }
 
     rotateGold(direction) {
@@ -169,9 +231,11 @@ class BannerRotation {
         // Add active class to new group
         $groups.eq(this.goldIndex).addClass('active');
 
-        // Reset timer
-        clearInterval(this.goldTimer);
-        this.startGoldRotation();
+        // Reset timer when in automatic rotation mode
+        if (this.automaticRotationEnabled) {
+            clearInterval(this.goldTimer);
+            this.startGoldRotation();
+        }
     }
 }
 
@@ -211,7 +275,9 @@ class Dashboard {
         // jQuery elements
         this.$logContainer = $('#log-container');
         this.$errorContainer = $('#error-container');
+        this.$saveLogsBtn = $('#save-logs-btn');
         this.$copyLogsBtn = $('#copy-logs-btn');
+        this.$clearLogsBtn = $('#clear-logs-btn');
         this.$menuToggle = $('#menu-toggle');
         this.$menuDropdown = $('#menu-dropdown');
         this.$menuShutdown = $('#menu-shutdown');
@@ -241,6 +307,8 @@ class Dashboard {
         this.$modalCloseRemove = $('.modal-close-remove');
         this.$editMemoryModal = $('#edit-memory-modal');
         this.$editMemoryName = $('#edit-memory-name');
+        this.$editMemoryRenameBtn = $('#edit-memory-rename-btn');
+        this.$editMemoryRenameInput = $('#edit-memory-rename-input');
         this.$editMemoryContent = $('#edit-memory-content');
         this.$editMemorySaveBtn = $('#edit-memory-save-btn');
         this.$editMemoryCancelBtn = $('#edit-memory-cancel-btn');
@@ -278,7 +346,9 @@ class Dashboard {
         this.outputChart = null;
 
         // Register event handlers
+        this.$saveLogsBtn.click(this.saveLogs.bind(this));
         this.$copyLogsBtn.click(this.copyLogs.bind(this));
+        this.$clearLogsBtn.click(this.clearLogs.bind(this));
         this.$menuShutdown.click(function (e) {
             e.preventDefault();
             self.shutdown();
@@ -297,6 +367,19 @@ class Dashboard {
         this.$editMemoryCancelBtn.click(this.closeEditMemoryModal.bind(this));
         this.$modalCloseEditMemory.click(this.closeEditMemoryModal.bind(this));
         this.$editMemoryContent.on('input', this.trackMemoryChanges.bind(this));
+        this.$editMemoryRenameBtn.click(this.startMemoryRename.bind(this));
+        this.$editMemoryRenameInput.keydown(function (e) {
+            if (e.which === 13) { // Enter key
+                e.preventDefault();
+                self.commitMemoryRename();
+            } else if (e.which === 27) { // Escape key
+                e.preventDefault();
+                self.cancelMemoryRename();
+            }
+        });
+        this.$editMemoryRenameInput.on('blur', function () {
+            self.cancelMemoryRename();
+        });
         this.$deleteMemoryOkBtn.click(this.confirmDeleteMemoryOk.bind(this));
         this.$deleteMemoryCancelBtn.click(this.closeDeleteMemoryModal.bind(this));
         this.$modalCloseDeleteMemory.click(this.closeDeleteMemoryModal.bind(this));
@@ -1112,19 +1195,39 @@ class Dashboard {
         document.title = activeProject ? `${activeProject} – Serena Dashboard` : 'Serena Dashboard';
     }
 
+    updateLogButtons(hasLogs) {
+        this.$saveLogsBtn.prop('disabled', !hasLogs);
+        this.$copyLogsBtn.prop('disabled', !hasLogs);
+        this.$clearLogsBtn.prop('disabled', !hasLogs);
+    }
+
+    saveLogs() {
+        const logText = this.$logContainer.text();
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const blob = new Blob([logText], {type: 'text/plain'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `serena-logs-${timestamp}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        const originalHtml = this.$saveLogsBtn.html();
+        const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="log-action-btn-text">save logs</span>';
+        this.$saveLogsBtn.html(checkmarkSvg);
+        setTimeout(() => { this.$saveLogsBtn.html(originalHtml); }, 1500);
+    }
+
     copyLogs() {
         const logText = this.$logContainer.text();
-
-        if (!logText) {
-            alert('No logs to copy');
-            return;
-        }
 
         // Use the Clipboard API to copy text
         navigator.clipboard.writeText(logText).then(() => {
             // Visual feedback - temporarily change icon to grey checkmark
             const originalHtml = this.$copyLogsBtn.html();
-            const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="copy-logs-text">copy logs</span>';
+            const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="log-action-btn-text">copy logs</span>';
             this.$copyLogsBtn.html(checkmarkSvg);
 
             setTimeout(() => {
@@ -1132,7 +1235,27 @@ class Dashboard {
             }, 1500);
         }).catch(err => {
             console.error('Failed to copy logs:', err);
-            alert('Failed to copy logs to clipboard');
+        });
+    }
+
+    clearLogs() {
+        let self = this;
+        $.ajax({
+            url: '/clear_logs',
+            type: 'POST',
+            success: function () {
+                self.$logContainer.empty();
+                self.currentMaxIdx = -1;
+                self.updateLogButtons(false);
+
+                const originalHtml = self.$clearLogsBtn.html();
+                const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="log-action-btn-text">clear logs</span>';
+                self.$clearLogsBtn.html(checkmarkSvg);
+                setTimeout(() => { self.$clearLogsBtn.html(originalHtml); }, 1500);
+            },
+            error: function (xhr, status, error) {
+                console.error('Failed to clear logs:', error);
+            }
         });
     }
 
@@ -1166,6 +1289,7 @@ class Dashboard {
                     $('#log-container').html('<div class="loading">No log messages found.</div>');
                 }
 
+                self.updateLogButtons(response.messages && response.messages.length > 0);
                 self.updateTitle(response.active_project);
 
                 // Start periodic polling for new logs
@@ -1205,6 +1329,8 @@ class Dashboard {
 
                     // Update max_idx
                     self.currentMaxIdx = response.max_idx || self.currentMaxIdx;
+
+                    self.updateLogButtons(true);
 
                     // Auto-scroll to bottom if user was already at bottom
                     if (wasAtBottom) {
@@ -1776,6 +1902,62 @@ class Dashboard {
         });
     }
 
+    startMemoryRename() {
+        this.$editMemoryName.hide();
+        this.$editMemoryRenameBtn.hide();
+        this.$editMemoryRenameInput.val(this.currentMemoryName).show().focus().select();
+    }
+
+    cancelMemoryRename() {
+        this.$editMemoryRenameInput.hide();
+        this.$editMemoryName.show();
+        this.$editMemoryRenameBtn.show();
+    }
+
+    commitMemoryRename() {
+        const newName = this.$editMemoryRenameInput.val().trim();
+        const oldName = this.currentMemoryName;
+
+        // If name unchanged, just cancel
+        if (!newName || newName === oldName) {
+            this.cancelMemoryRename();
+            return;
+        }
+
+        // Validate memory name (alphanumeric, underscores, and slashes for subdirectories)
+        if (!/^[a-zA-Z0-9_]+(?:\/[a-zA-Z0-9_]+)*$/.test(newName)) {
+            alert('Memory name can only contain letters, numbers, underscores, and "/" for subdirectories (e.g., "topic/memory_name")');
+            this.$editMemoryRenameInput.focus();
+            return;
+        }
+
+        const self = this;
+        this.$editMemoryRenameInput.prop('disabled', true);
+
+        $.ajax({
+            url: '/rename_memory', type: 'POST', contentType: 'application/json', data: JSON.stringify({
+                old_name: oldName, new_name: newName
+            }), success: function (response) {
+                if (response.status === 'success') {
+                    self.currentMemoryName = newName;
+                    self.$editMemoryName.text(newName);
+                    self.cancelMemoryRename();
+                    // Reload config to reflect the rename in the memory list
+                    self.loadConfigOverview();
+                } else {
+                    alert('Error: ' + response.message);
+                    self.$editMemoryRenameInput.focus();
+                }
+            }, error: function (xhr, status, error) {
+                console.error('Error renaming memory:', error);
+                alert('Error renaming memory: ' + (xhr.responseJSON ? xhr.responseJSON.message : error));
+                self.$editMemoryRenameInput.focus();
+            }, complete: function () {
+                self.$editMemoryRenameInput.prop('disabled', false);
+            }
+        });
+    }
+
     confirmDeleteMemory(memoryName) {
         // Set memory name to delete
         this.memoryToDelete = memoryName;
@@ -1849,9 +2031,9 @@ class Dashboard {
             return;
         }
 
-        // Validate memory name (alphanumeric and underscores only)
-        if (!/^[a-zA-Z0-9_]+$/.test(memoryName)) {
-            alert('Memory name can only contain letters, numbers, and underscores');
+        // Validate memory name (alphanumeric, underscores, and slashes for subdirectories)
+        if (!/^[a-zA-Z0-9_]+(?:\/[a-zA-Z0-9_]+)*$/.test(memoryName)) {
+            alert('Memory name can only contain letters, numbers, underscores, and "/" for subdirectories (e.g., "topic/memory_name")');
             return;
         }
 

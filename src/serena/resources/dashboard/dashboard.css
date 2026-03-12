@@ -207,17 +207,53 @@ body {
     top: 0;
     left: 0;
     order: 2;
+    height: var(--header-height);
     max-height: var(--header-height);
 }
 
 .header-nav {
     position: relative;
     display: flex;
+    flex-direction: column;
     align-items: flex-end;
-    width: 200px;
+    justify-content: space-between;
     height: 100%;
-    gap: 10px;
     flex-shrink: 0;
+}
+
+.header-actions {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.header-tabs {
+    display: flex;
+    align-items: flex-end;
+    gap: 0;
+}
+
+.header-tab {
+    display: flex;
+    align-items: center;
+    padding: 8px 20px;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 15px;
+    font-weight: 500;
+    border-bottom: 3px solid transparent;
+    transition: color 0.2s ease, border-color 0.2s ease;
+    white-space: nowrap;
+}
+
+.header-tab:hover {
+    color: var(--text-primary);
+}
+
+.header-tab.active {
+    color: var(--btn-primary);
+    border-bottom-color: var(--btn-primary);
 }
 
 .menu-button {
@@ -240,7 +276,8 @@ body {
 
 .menu-dropdown {
     position: absolute;
-    top: calc(var(--header-height) + 10px);
+    top: 100%;
+    margin-top: 6px;
     right: 0;
     background-color: var(--bg-secondary);
     border: 1px solid var(--border-color);
@@ -275,17 +312,13 @@ body {
 }
 
 .platinum-banner-slide {
-    position: absolute;
-    top: 0;
-    left: 0;
+    display: none;
     pointer-events: none;
     height: 100%;
-    opacity: 0;
-    transition: opacity 0.5s ease-in-out;
 }
 
 .platinum-banner-slide.active {
-    opacity: 1;
+    display: block;
     pointer-events: auto;
 }
 
@@ -315,25 +348,59 @@ body {
 .gold-banner {
     position: relative;
     width: 100%;
-    height: 60px;
     overflow: hidden;
 }
 
 .gold-banner-slide {
-    position: absolute;
+    display: none;
     pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.5s ease-in-out;
 }
 
 .gold-banner-slide.active {
-    opacity: 1;
+    display: block;
     pointer-events: auto;
 }
 
 .gold-banner-slide .banner-image {
     max-width: 100%;
     object-fit: contain;
+}
+
+/* Banner Arrow Navigation */
+.banner-arrow {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 10;
+    background: rgba(128, 128, 128, 0.15);
+    color: var(--text-muted);
+    border: none;
+    font-size: 18px;
+    line-height: 1;
+    width: 24px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 4px;
+    opacity: 0.3;
+    transition: opacity 0.2s ease, background-color 0.2s ease, color 0.2s ease;
+    padding: 0;
+}
+
+.banner-arrow:hover {
+    opacity: 0.8;
+    background: rgba(128, 128, 128, 0.4);
+    color: var(--text-primary);
+}
+
+.banner-arrow-left {
+    left: 0;
+}
+
+.banner-arrow-right {
+    right: 0;
 }
 
 .page-view {
@@ -966,6 +1033,14 @@ body {
 
     .header-nav {
         width: 100%;
+        align-items: center;
+    }
+
+    .header-tabs {
+        justify-content: center;
+    }
+
+    .header-actions {
         justify-content: center;
     }
 
@@ -1233,12 +1308,54 @@ body {
     gap: 8px;
 }
 
-/* Copy Logs Button */
-.copy-logs-btn {
+/* Memory Rename Styles */
+.memory-rename-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text-muted);
+    opacity: 0.5;
+    transition: opacity 0.2s ease, background-color 0.2s ease;
+}
+
+.memory-rename-btn:hover {
+    opacity: 1;
+    background-color: var(--border-color);
+}
+
+.memory-rename-input {
+    font-size: inherit;
+    font-weight: inherit;
+    font-family: inherit;
+    color: var(--text-primary);
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--btn-primary);
+    outline: none;
+    padding: 0;
+    flex: 1;
+    min-width: 200px;
+    max-width: 80%;
+}
+
+/* Log Action Buttons (Save, Copy, Clear) */
+.log-action-buttons {
     position: absolute;
     top: 15px;
-    right: 15px;
+    right: 20px;
     z-index: 10;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.log-action-btn {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -1249,25 +1366,36 @@ body {
     color: var(--text-primary);
     cursor: pointer;
     opacity: 0.8;
-    transition: opacity 0.2s ease, background-color 0.2s ease;
+    transition: opacity 0.2s ease, background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
     font-size: 13px;
     font-weight: 500;
 }
 
-.copy-logs-btn:hover {
+.log-action-btn:hover {
     opacity: 1;
     background-color: var(--border-color);
 }
 
-.copy-logs-btn svg {
+.log-action-btn svg {
     flex-shrink: 0;
 }
 
-.copy-logs-text {
+.log-action-btn-text {
     display: none;
     white-space: nowrap;
 }
 
-.copy-logs-btn:hover .copy-logs-text {
+.log-action-btn:hover .log-action-btn-text {
     display: inline;
+}
+
+.log-action-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+.log-action-btn-danger:hover {
+    background-color: var(--border-color);
+    border-color: rgba(220, 53, 53, 0.9);
+    color: var(--log-error);
 }

@@ -20,12 +20,15 @@ SERENA_ICON_DIR = str(_serena_pkg_path / "resources" / "icons")
 DEFAULT_SOURCE_FILE_ENCODING = "utf-8"
 """The default encoding assumed for project source files."""
 DEFAULT_CONTEXT = "desktop-app"
-DEFAULT_MODES = ("interactive", "editing")
 
 SERENA_FILE_ENCODING = "utf-8"
 """The encoding used for Serena's own files, such as configuration files and memories."""
 
 PROJECT_TEMPLATE_FILE = str(_serena_pkg_path / "resources" / "project.template.yml")
+PROJECT_LOCAL_TEMPLATE_FILE = str(_serena_pkg_path / "resources" / "project.local.template.yml")
 SERENA_CONFIG_TEMPLATE_FILE = str(_serena_pkg_path / "resources" / "serena_config.template.yml")
 
 SERENA_LOG_FORMAT = "%(levelname)-5s %(asctime)-15s [%(threadName)s] %(name)s:%(funcName)s:%(lineno)d - %(message)s"
+
+LOG_MESSAGES_BUFFER_SIZE = 2500
+"""The maximum number of log messages to keep in the buffer (for the dashboard)."""

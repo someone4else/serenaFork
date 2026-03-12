@@ -96,7 +96,7 @@ claude mcp add --scope user serena -- uvx --from git+https://github.com/oraios/s
 ```
 
 Whenever you start Claude Code, Serena will search up from the current directory for `.serena/project.yml` or `.git` markers,
-activating the current directory as the project if neither is found. 
+activating the containing directory as the project (if any). 
 This mechanism makes it suitable for a single global MCP configuration.
 
 **Maximum Token Efficiency.** To maximize token efficiency, you may want to use Claude Code's 
@@ -159,9 +159,11 @@ args = ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-s
 
 After codex has started, you need to activate the project, which you can do by saying:
 
-"Activate the current dir as project using serena"
+> Call serena.activate_project, serena.check_onboarding_performed and serena.initial_instructions
 
-> If you don't activate the project, you will not be able to use Serena's tools!
+**If you don't activate the project, you will not be able to use Serena's tools!**
+
+It is recommend to set this prompt as a [custom prompt](https://developers.openai.com/codex/custom-prompts), so you don't need to type this every time.
 
 That's it! Have a look at `~/.codex/log/codex-tui.log` to see if any errors occurred.
 
@@ -269,13 +271,6 @@ Then make sure to configure the working directory to be the project root.
 
 ## Antigravity
 
-:::{warning}
-At the time of writing (12/2025), Antigravity does not seem to work with Serena due to schema validation issues
-which are beyond our control.
-The client starts Serena but then crashes with `[internal] marshal message: string field contains invalid UTF-8`.  
-Nevertheless, we provide a configuration that should work once the issue is resolved.
-:::
-
 Add this configuration:
 
 ```json
@@ -295,6 +290,12 @@ Add this configuration:
   }
 }
 ```
+
+You will have to prompt Antigravity's agent to "Activate the current project using serena's activation tool" after starting Antigravity in the project directory (once in the first chat enough, all other chat sessions will continue using the same Serena session).
+
+
+Unlike VSCode, Antigravity does not currently support including the working directory in the MCP configuration.
+Also, the current client will be shown as `none` in Serena's dashboard (Antigravity currently does not fully support the MCP specifications). This is not a problem, all tools will work as expected.
 
 ## Other Clients
 
