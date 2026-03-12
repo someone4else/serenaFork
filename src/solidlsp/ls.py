@@ -1830,9 +1830,9 @@ class SolidLanguageServer(ABC):
         :return: The container symbol (if found) or None.
         """
         # checking if the line is empty, unfortunately ugly and duplicating code, but I don't want to refactor
-        with self.open_file(relative_file_path):
+        with self.open_file(relative_file_path) as fb:
             absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
-            content = FileUtils.read_file(absolute_file_path, self._encoding)
+            content = fb.contents
             if content.split("\n")[line].strip() == "":
                 log.error(f"Passing empty lines to request_container_symbol is currently not supported, {relative_file_path=}, {line=}")
                 return None

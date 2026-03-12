@@ -1,6 +1,5 @@
 import concurrent.futures
 import threading
-import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ class TaskExecutor:
     def __init__(self, name: str):
         self._task_executor_lock = threading.Lock()
         self._task_executor_queue: list[TaskExecutor.Task] = []
+        self._task_event = threading.Event()
         self._task_executor_thread = Thread(target=self._process_task_queue, name=name, daemon=True)
         self._task_executor_thread.start()
         self._task_executor_task_index = 1
@@ -113,7 +113,8 @@ class TaskExecutor:
                 if len(self._task_executor_queue) > 0:
                     task = self._task_executor_queue.pop(0)
             if task is None:
-                time.sleep(0.1)
+                self._task_event.wait(timeout=1.0)
+                self._task_event.clear()
                 continue
 
             # start task execution asynchronously
@@ -192,6 +193,7 @@ class TaskExecutor:
                 log.info(f"Scheduling {task_name}")
             task_obj = self.Task(function=task, name=task_name, logged=logged, timeout=timeout)
             self._task_executor_queue.append(task_obj)
+            self._task_event.set()
             return task_obj
 
     def execute_task(self, task: Callable[[], T], name: str | None = None, logged: bool = True, timeout: float | None = None) -> T:

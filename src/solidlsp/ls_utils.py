@@ -8,8 +8,10 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 import uuid
 import zipfile
+from collections import OrderedDict
 from enum import Enum
 from pathlib import Path, PurePath
 
@@ -171,11 +173,16 @@ class FileUtils:
     Utility functions for file operations.
     """
 
+    _ENCODING_CACHE_MAX_SIZE = 256
+    _encoding_cache: OrderedDict[tuple[str, float], str] = OrderedDict()
+    _encoding_cache_lock = threading.Lock()
+
     @staticmethod
     def read_file(file_path: str, encoding: str) -> str:
         """
         Reads the file at the given path using the given encoding and returns the contents as a string.
         If decoding fails, tries to detect the encoding using charset_normalizer.
+        Detected encodings are cached by (file_path, mtime) to avoid redundant analysis.
 
         Raises FileNotFoundError if the file does not exist.
         """
@@ -187,14 +194,30 @@ class FileUtils:
                 with open(file_path, encoding=encoding) as inp_file:
                     return inp_file.read()
             except UnicodeDecodeError as ude:
-                results = charset_normalizer.from_path(file_path)
-                match = results.best()
-                if match:
-                    log.warning(
-                        f"Could not decode {file_path} with encoding='{encoding}'; using best match '{match.encoding}' instead",
-                    )
-                    return match.raw.decode(match.encoding)
-                raise ude
+                mtime = os.path.getmtime(file_path)
+                cache_key = (file_path, mtime)
+                with FileUtils._encoding_cache_lock:
+                    detected_encoding = FileUtils._encoding_cache.get(cache_key)
+                    if detected_encoding is not None:
+                        # move to end to mark as recently used
+                        FileUtils._encoding_cache.move_to_end(cache_key)
+                if detected_encoding is None:
+                    results = charset_normalizer.from_path(file_path)
+                    match = results.best()
+                    if match:
+                        detected_encoding = match.encoding
+                        with FileUtils._encoding_cache_lock:
+                            if len(FileUtils._encoding_cache) >= FileUtils._ENCODING_CACHE_MAX_SIZE:
+                                # evict the least recently used entry
+                                FileUtils._encoding_cache.popitem(last=False)
+                            FileUtils._encoding_cache[cache_key] = detected_encoding
+                    else:
+                        raise ude
+                log.warning(
+                    f"Could not decode {file_path} with encoding='{encoding}'; using cached/detected encoding '{detected_encoding}' instead",
+                )
+                with open(file_path, encoding=detected_encoding) as inp_file:
+                    return inp_file.read()
         except Exception as exc:
             log.error(f"Failed to read '{file_path}' with encoding '{encoding}': {exc}")
             raise exc
