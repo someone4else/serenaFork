@@ -20,9 +20,13 @@ from solidlsp.ls_types import SymbolKind
 # and provide no useful information at depth=0 on their own.
 _TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Module, SymbolKind.Package})
 
-# Symbol kinds for which the LSP 'detail' field (e.g. the function signature) should be
-# appended to the name in the symbols overview output.
-_DETAIL_INCLUDED_KINDS = frozenset({SymbolKind.Method, SymbolKind.Function, SymbolKind.Constructor})
+# Symbol kinds for which the LSP 'detail' field should be appended to the name in the
+# symbols overview output. For callables this is the signature (e.g. "(int a, int b): int");
+# for classes/interfaces/structs it often contains inheritance info (e.g. ": BaseClass, IInterface").
+_DETAIL_INCLUDED_KINDS = frozenset({
+    SymbolKind.Method, SymbolKind.Function, SymbolKind.Constructor,
+    SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct,
+})
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
