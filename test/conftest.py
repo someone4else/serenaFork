@@ -174,6 +174,8 @@ def language_server(request: LanguageParamRequest):
         raise ValueError("Language parameter must be provided via pytest.mark.parametrize")
 
     language = request.param
+    if not language_tests_enabled(language):
+        pytest.skip(f"Tests for language {language} are not enabled.")
     with start_default_ls_context(language) as ls:
         yield ls
 
@@ -273,6 +275,76 @@ def _determine_disabled_languages() -> list[Language]:
     php_tests_enabled = _sh.which("php") is not None
     if not php_tests_enabled:
         result.append(Language.PHP_PHPACTOR)
+
+    # Disable Go tests if gopls is not available
+    gopls_tests_enabled = _sh.which("gopls") is not None
+    if not gopls_tests_enabled:
+        result.append(Language.GO)
+
+    # Disable Lean4 tests if lean is not available
+    lean4_tests_enabled = _sh.which("lean") is not None
+    if not lean4_tests_enabled:
+        result.append(Language.LEAN4)
+
+    # Disable OCaml tests if opam is not available
+    ocaml_tests_enabled = _sh.which("opam") is not None
+    if not ocaml_tests_enabled:
+        result.append(Language.OCAML)
+
+    # Disable Zig tests if zig is not available
+    zig_tests_enabled = _sh.which("zig") is not None
+    if not zig_tests_enabled:
+        result.append(Language.ZIG)
+
+    # Disable Haskell tests if haskell-language-server-wrapper is not available
+    haskell_tests_enabled = _sh.which("haskell-language-server-wrapper") is not None
+    if not haskell_tests_enabled:
+        result.append(Language.HASKELL)
+
+    # Disable Nix tests if nix is not available
+    nix_tests_enabled = _sh.which("nix") is not None
+    if not nix_tests_enabled:
+        result.append(Language.NIX)
+
+    # Disable R tests if R is not available
+    r_tests_enabled = _sh.which("R") is not None
+    if not r_tests_enabled:
+        result.append(Language.R)
+
+    # Disable Elm tests if elm runtime is not available (language server requires elm for workspace detection)
+    elm_tests_enabled = _sh.which("elm") is not None
+    if not elm_tests_enabled:
+        result.append(Language.ELM)
+
+    # Disable Rego tests if regal language server is not available
+    rego_tests_enabled = _sh.which("regal") is not None
+    if not rego_tests_enabled:
+        result.append(Language.REGO)
+
+    # Disable Swift tests if sourcekit-lsp is not available
+    swift_tests_enabled = _sh.which("sourcekit-lsp") is not None
+    if not swift_tests_enabled:
+        result.append(Language.SWIFT)
+
+    # Disable Terraform tests if terraform is not available
+    terraform_tests_enabled = _sh.which("terraform") is not None
+    if not terraform_tests_enabled:
+        result.append(Language.TERRAFORM)
+
+    # Disable Ruby tests if ruby-lsp cannot be installed (gem permission issues in CI)
+    ruby_tests_enabled = _sh.which("ruby") is not None and _sh.which("gem") is not None
+    if ruby_tests_enabled:
+        try:
+            import subprocess as _subprocess
+
+            result_proc = _subprocess.run(["gem", "list", "ruby-lsp"], capture_output=True, text=True, check=False)
+            if "ruby-lsp" not in result_proc.stdout:
+                # gem install would be needed but may fail in CI; disable ruby tests
+                ruby_tests_enabled = False
+        except Exception:
+            ruby_tests_enabled = False
+    if not ruby_tests_enabled:
+        result.append(Language.RUBY)
 
     al_tests_enabled = True
     if not al_tests_enabled:
