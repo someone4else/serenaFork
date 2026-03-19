@@ -75,13 +75,13 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
             raise ValueError(f"Expected a file path, but got a directory path: {relative_path}. ")
         if not symbol_retriever.can_analyze_file(relative_path):
             raise ValueError(
-                f"Cannot extract symbols from file {relative_path}. Active languages: {[l.value for l in self.agent.get_active_lsp_languages()]}"
+                f"Cannot extract symbols from file {relative_path}. Active languages: {[l.value for l in self.agent.get_active_lsp_languages()]}
             )
 
         symbols = symbol_retriever.get_symbol_overview(relative_path)[relative_path]
 
         def child_inclusion_predicate(s: LanguageServerSymbol) -> bool:
-            return not s.is_low_level()
+            return not s.is_low-level()
 
         symbol_dicts: list[LanguageServerSymbol.OutputDict] = []
         for symbol in symbols:
@@ -106,8 +106,9 @@ def _flatten_transparent_containers_to_dicts(
     always sees meaningful content even at depth=0.
 
     For transparent containers the strategy is:
-      - The container itself is emitted with ``max(depth, 1)`` so that its children
-        (the real types/functions) are always visible.
+      - The container itself is emitted with ``depth + 1`` so that its children
+        (the real types/functions) are always visible and the transparent container
+        does not consume one of the user's requested depth levels.
       - If a transparent container has *exactly one* child and that child is also
         transparent, we recurse and flatten further so the user doesn't see a
         chain of nested namespaces.
@@ -143,10 +144,12 @@ def _flatten_transparent_containers_to_dicts(
             child_inclusion_predicate=child_inclusion_predicate,
         )
 
-    # The container has substantive children - emit it with effective_depth
-    # so that the user always sees at least the direct children
-    # (classes, interfaces, etc.) even when the caller passed depth=0.
-    effective_depth = max(depth, 1)
+    # The container has substantive children - emit it with depth + 1
+    # to compensate for the depth level consumed by the transparent container itself.
+    # This ensures the user's requested depth applies to the "real" symbols inside.
+    # E.g. depth=0 -> Namespace rendered at depth=1 -> its Class children visible;
+    #      depth=1 -> Namespace rendered at depth=2 -> Class children + their Methods visible.
+    effective_depth = depth + 1
     return [
         symbol.to_dict(
             name_path=False,
