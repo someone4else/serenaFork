@@ -3,7 +3,7 @@ Language server-related tools
 """
 
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from serena.symbol import LanguageServerSymbol, LanguageServerSymbolDictGrouper
 from serena.tools import (
@@ -14,6 +14,11 @@ from serena.tools import (
 )
 from serena.tools.tools_base import ToolMarkerOptional
 from solidlsp.ls_types import SymbolKind
+
+# Symbol kinds that are purely structural containers (namespaces, modules, packages).
+# In languages like C#/Java these wrap the "real" symbols (classes, interfaces, etc.)
+# and provide no useful information at depth=0 on their own.
+_TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Module, SymbolKind.Package})
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -78,20 +83,81 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         def child_inclusion_predicate(s: LanguageServerSymbol) -> bool:
             return not s.is_low_level()
 
-        symbol_dicts = []
+        symbol_dicts: list[LanguageServerSymbol.OutputDict] = []
         for symbol in symbols:
-            symbol_dicts.append(
-                symbol.to_dict(
-                    name_path=False,
-                    name=True,
+            symbol_dicts.extend(
+                _flatten_transparent_containers_to_dicts(
+                    symbol,
                     depth=depth,
-                    kind=True,
-                    relative_path=False,
-                    location=False,
                     child_inclusion_predicate=child_inclusion_predicate,
                 )
             )
         return symbol_dicts
+
+
+def _flatten_transparent_containers_to_dicts(
+    symbol: LanguageServerSymbol,
+    depth: int,
+    child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
+) -> list[LanguageServerSymbol.OutputDict]:
+    """
+    Converts a symbol to one or more OutputDicts, automatically "seeing through"
+    purely structural containers (Namespace, Module, Package) so that the user
+    always sees meaningful content even at depth=0.
+
+    For transparent containers the strategy is:
+      - The container itself is emitted with ``max(depth, 1)`` so that its children
+        (the real types/functions) are always visible.
+      - If a transparent container has *exactly one* child and that child is also
+        transparent, we recurse and flatten further so the user doesn't see a
+        chain of nested namespaces.
+
+    For all other symbols the behaviour is identical to the original code.
+    """
+    if symbol.symbol_kind not in _TRANSPARENT_CONTAINER_KINDS:
+        # Normal symbol - emit as before
+        return [
+            symbol.to_dict(
+                name_path=False,
+                name=True,
+                depth=depth,
+                kind=True,
+                relative_path=False,
+                location=False,
+                child_inclusion_predicate=child_inclusion_predicate,
+            )
+        ]
+
+    # --- Transparent container handling ---
+
+    children = [c for c in symbol.iter_children() if child_inclusion_predicate(c)]
+
+    # If the container has exactly one child that is *also* a transparent container,
+    # skip the outer wrapper entirely and recurse on the inner one.
+    # This collapses chains like  Namespace(A) -> Namespace(A.B) -> Class(Foo)
+    # into a single entry "Namespace A.B -> { Class Foo }".
+    if len(children) == 1 and children[0].symbol_kind in _TRANSPARENT_CONTAINER_KINDS:
+        return _flatten_transparent_containers_to_dicts(
+            children[0],
+            depth=depth,
+            child_inclusion_predicate=child_inclusion_predicate,
+        )
+
+    # The container has substantive children - emit it with effective_depth
+    # so that the user always sees at least the direct children
+    # (classes, interfaces, etc.) even when the caller passed depth=0.
+    effective_depth = max(depth, 1)
+    return [
+        symbol.to_dict(
+            name_path=False,
+            name=True,
+            depth=effective_depth,
+            kind=True,
+            relative_path=False,
+            location=False,
+            child_inclusion_predicate=child_inclusion_predicate,
+        )
+    ]
 
 
 class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
