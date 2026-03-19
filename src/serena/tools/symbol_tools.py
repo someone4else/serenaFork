@@ -15,11 +15,7 @@ from serena.tools import (
 from serena.tools.tools_base import ToolMarkerOptional
 from solidlsp.ls_types import SymbolKind
 
-# Symbol kinds that are purely structural containers (namespaces, modules, packages).
-# In languages like C#/Java these wrap the "real" symbols (classes, interfaces, etc.)
-# and provide no useful information at depth=0 on their own.
 _TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Module, SymbolKind.Package})
-
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
     """Restarts the language server, may be necessary when edits not through Serena happen."""
@@ -30,7 +26,6 @@ class RestartLanguageServerTool(Tool, ToolMarkerOptional):
         """
         self.agent.reset_language_server_manager()
         return SUCCESS_RESULT
-
 
 class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
     """
@@ -66,8 +61,6 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         """
         symbol_retriever = self.create_language_server_symbol_retriever()
 
-        # The symbol overview is capable of working with both files and directories,
-        # but we want to ensure that the user provides a file path.
         file_path = os.path.join(self.project.project_root, relative_path)
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File or directory {relative_path} does not exist in the project.")
@@ -114,9 +107,8 @@ def _flatten_transparent_containers_to_dicts(
         chain of nested namespaces.
 
     For all other symbols the behaviour is identical to the original code.
-    """
+    """    
     if symbol.symbol_kind not in _TRANSPARENT_CONTAINER_KINDS:
-        # Normal symbol - emit as before
         return [
             symbol.to_dict(
                 name_path=False,
@@ -129,14 +121,8 @@ def _flatten_transparent_containers_to_dicts(
             )
         ]
 
-    # --- Transparent container handling ---
-
     children = [c for c in symbol.iter_children() if child_inclusion_predicate(c)]
 
-    # If the container has exactly one child that is *also* a transparent container,
-    # skip the outer wrapper entirely and recurse on the inner one.
-    # This collapses chains like  Namespace(A) -> Namespace(A.B) -> Class(Foo)
-    # into a single entry "Namespace A.B -> { Class Foo }".
     if len(children) == 1 and children[0].symbol_kind in _TRANSPARENT_CONTAINER_KINDS:
         return _flatten_transparent_containers_to_dicts(
             children[0],
@@ -144,11 +130,6 @@ def _flatten_transparent_containers_to_dicts(
             child_inclusion_predicate=child_inclusion_predicate,
         )
 
-    # The container has substantive children - emit it with depth + 1
-    # to compensate for the depth level consumed by the transparent container itself.
-    # This ensures the user's requested depth applies to the "real" symbols inside.
-    # E.g. depth=0 -> Namespace rendered at depth=1 -> its Class children visible;
-    #      depth=1 -> Namespace rendered at depth=2 -> Class children + their Methods visible.
     effective_depth = depth + 1
     return [
         symbol.to_dict(
@@ -164,11 +145,8 @@ def _flatten_transparent_containers_to_dicts(
 
 
 class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
-    """
-    Performs a global (or local) search using the language server backend.
-    """
+    """Performs a global (or local) search using the language server backend."""
 
-    # noinspection PyDefaultArgument
     def apply(
         self,
         name_path_pattern: str,
@@ -190,13 +168,6 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
         For example, the method `my_method` defined in class `MyClass` would have the name path `MyClass/my_method`.
         If a symbol is overloaded (e.g., in Java), a 0-based index is appended (e.g. "MyClass/my_method[0]") to
         uniquely identify it.
-
-        To search for a symbol, you provide a name path pattern that is used to match against name paths.
-        It can be
-         * a simple name (e.g. "method"), which will match any symbol with that name
-         * a relative path like "class/method", which will match any symbol with that name path suffix
-         * an absolute name path "/class/method" (absolute name path), which requires an exact match of the full name path within the source file.
-        Append an index `[i]` to match a specific overload only, e.g. "MyClass/my_method[1]".
 
         :param name_path_pattern: the name path matching pattern (see above)
         :param depth: depth up to which descendants shall be retrieved (e.g. use 1 to also retrieve immediate children;
@@ -240,15 +211,11 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
         result = self._to_json(symbol_dicts)
         return self._limit_length(result, max_answer_chars)
 
-
 class FindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead):
-    """
-    Finds symbols that reference the given symbol using the language server backend
-    """
+    """Finds symbols that reference the given symbol using the language server backend"""
 
     symbol_dict_grouper = LanguageServerSymbolDictGrouper(["relative_path", "kind"], ["kind"], collapse_singleton=True)
 
-    # noinspection PyDefaultArgument
     def apply(
         self,
         name_path: str,
@@ -257,18 +224,8 @@ class FindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead):
         exclude_kinds: list[int] = [],  # noqa: B006
         max_answer_chars: int = -1,
     ) -> str:
-        """
-        Finds references to the symbol at the given `name_path`. The result will contain metadata about the referencing symbols
-        as well as a short code snippet around the reference.
-
-        :param name_path: for finding the symbol to find references for, same logic as in the `find_symbol` tool.
-        :param relative_path: the relative path to the file containing the symbol for which to find references.
-            Note that here you can't pass a directory but must pass a file.
-        :param include_kinds: same as in the `find_symbol` tool.
-        :param exclude_kinds: same as in the `find_symbol` tool.
-        :param max_answer_chars: same as in the `find_symbol` tool.
-        :return: a list of JSON objects with the symbols referencing the requested symbol
-        """
+        """Finds references to the symbol at the given `name_path`. The result will contain metadata about the referencing symbols
+        as well as a short code snippet around the reference. """
         include_body = False  # It is probably never a good idea to include the body of the referencing symbols
         parsed_include_kinds: Sequence[SymbolKind] | None = [SymbolKind(k) for k in include_kinds] if include_kinds else None
         parsed_exclude_kinds: Sequence[SymbolKind] | None = [SymbolKind(k) for k in exclude_kinds] if exclude_kinds else None
@@ -300,11 +257,8 @@ class FindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead):
         result_json = self._to_json(result)
         return self._limit_length(result_json, max_answer_chars)
 
-
 class ReplaceSymbolBodyTool(Tool, ToolMarkerSymbolicEdit):
-    """
-    Replaces the full definition of a symbol using the language server backend.
-    """
+    """Replaces the full definition of a symbol using the language server backend."""
 
     def apply(
         self,
@@ -312,8 +266,7 @@ class ReplaceSymbolBodyTool(Tool, ToolMarkerSymbolicEdit):
         relative_path: str,
         body: str,
     ) -> str:
-        r"""
-        Replaces the body of the symbol with the given `name_path`.
+        r"""Replaces the body of the symbol with the given `name_path`.
 
         The tool shall be used to replace symbol bodies that have been previously retrieved
         (e.g. via `find_symbol`).
@@ -333,11 +286,8 @@ class ReplaceSymbolBodyTool(Tool, ToolMarkerSymbolicEdit):
         )
         return SUCCESS_RESULT
 
-
 class InsertAfterSymbolTool(Tool, ToolMarkerSymbolicEdit):
-    """
-    Inserts content after the end of the definition of a given symbol.
-    """
+    """Inserts content after the end of the definition of a given symbol."""
 
     def apply(
         self,
@@ -345,8 +295,7 @@ class InsertAfterSymbolTool(Tool, ToolMarkerSymbolicEdit):
         relative_path: str,
         body: str,
     ) -> str:
-        """
-        Inserts the given body/content after the end of the definition of the given symbol (via the symbol's location).
+        """Inserts the given body/content after the end of the definition of the given symbol (via the symbol's location).
         A typical use case is to insert a new class, function, method, field or variable assignment.
 
         :param name_path: name path of the symbol after which to insert content (definitions in the `find_symbol` tool apply)
@@ -358,11 +307,8 @@ class InsertAfterSymbolTool(Tool, ToolMarkerSymbolicEdit):
         code_editor.insert_after_symbol(name_path, relative_file_path=relative_path, body=body)
         return SUCCESS_RESULT
 
-
 class InsertBeforeSymbolTool(Tool, ToolMarkerSymbolicEdit):
-    """
-    Inserts content before the beginning of the definition of a given symbol.
-    """
+    """Inserts content before the beginning of the definition of a given symbol."""
 
     def apply(
         self,
@@ -370,8 +316,7 @@ class InsertBeforeSymbolTool(Tool, ToolMarkerSymbolicEdit):
         relative_path: str,
         body: str,
     ) -> str:
-        """
-        Inserts the given content before the beginning of the definition of the given symbol (via the symbol's location).
+        """Inserts the given content before the beginning of the definition of the given symbol (via the symbol's location).
         A typical use case is to insert a new class, function, method, field or variable assignment; or
         a new import statement before the first symbol in the file.
 
@@ -383,11 +328,8 @@ class InsertBeforeSymbolTool(Tool, ToolMarkerSymbolicEdit):
         code_editor.insert_before_symbol(name_path, relative_file_path=relative_path, body=body)
         return SUCCESS_RESULT
 
-
 class RenameSymbolTool(Tool, ToolMarkerSymbolicEdit):
-    """
-    Renames a symbol throughout the codebase using language server refactoring capabilities.
-    """
+    """Renames a symbol throughout the codebase using language server refactoring capabilities."""
 
     def apply(
         self,
@@ -395,8 +337,7 @@ class RenameSymbolTool(Tool, ToolMarkerSymbolicEdit):
         relative_path: str,
         new_name: str,
     ) -> str:
-        """
-        Renames the symbol with the given `name_path` to `new_name` throughout the entire codebase.
+        """Renames the symbol with the given `name_path` to `new_name` throughout the entire codebase.
         Note: for languages with method overloading, like Java, name_path may have to include a method's
         signature to uniquely identify a method.
 
