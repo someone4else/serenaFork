@@ -95,6 +95,41 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         return symbol_dicts
 
 
+def _count_singleton_wrapper_depth(
+    children: list[LanguageServerSymbol],
+    child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
+) -> int:
+    """
+    Returns 1 if the given children list represents a singleton non-transparent
+    wrapper (e.g. a lone Class inside a Namespace in a typical C# file), 0 otherwise.
+
+    A singleton wrapper is a non-transparent symbol that is the *only* visible child
+    at its level and itself has visible descendants.  In that case the symbol acts as
+    a structural wrapper and should not consume the user's depth budget.
+
+    Transparent containers are deliberately excluded here because they are already
+    handled by the recursion in ``_flatten_transparent_containers_to_dicts``.
+    The compensation is capped at +1: Class is a meaningful symbol (unlike Namespace),
+    so we do not recurse further.
+    """
+    if len(children) != 1:
+        return 0
+
+    only_child = children[0]
+
+    # Transparent containers are handled by the main function's recursion.
+    if only_child.symbol_kind in _TRANSPARENT_CONTAINER_KINDS:
+        return 0
+
+    # Check whether the sole non-transparent child itself has visible descendants.
+    has_grandchildren = any(child_inclusion_predicate(c) for c in only_child.iter_children())
+    if not has_grandchildren:
+        return 0  # Leaf symbol – no extra depth needed.
+
+    # The single non-transparent child (e.g. a Class) acts as a wrapper → +1.
+    return 1
+
+
 def _flatten_transparent_containers_to_dicts(
     symbol: LanguageServerSymbol,
     depth: int,
@@ -106,9 +141,16 @@ def _flatten_transparent_containers_to_dicts(
     always sees meaningful content even at depth=0.
 
     For transparent containers the strategy is:
-      - The container itself is emitted with ``depth + 1`` so that its children
-        (the real types/functions) are always visible and the transparent container
-        does not consume one of the user's requested depth levels.
+      - The container itself is emitted with an effective depth that compensates
+        for all "wrapper" levels between the container and the first level of real
+        content.  Specifically:
+          * ``+1`` for the transparent container itself (it is structural, not
+            meaningful, and should not consume the user's depth budget).
+          * ``+1`` (via ``_count_singleton_wrapper_depth``) if the transparent
+            container's only child is a *non-transparent* singleton wrapper (e.g.
+            a lone Class in a C# Namespace).  That Class also acts purely as a
+            structural wrapper in single-class files and should not consume the
+            user's depth budget either.
       - If a transparent container has *exactly one* child and that child is also
         transparent, we recurse and flatten further so the user doesn't see a
         chain of nested namespaces.
@@ -144,10 +186,11 @@ def _flatten_transparent_containers_to_dicts(
             child_inclusion_predicate=child_inclusion_predicate,
         )
 
-    # The container has substantive children - emit it with depth + 1
-    # so that the transparent container does not consume one of the user's
-    # requested depth levels (the container itself is structural, not meaningful).
-    effective_depth = depth + 1
+    # The container has substantive children - emit it with depth + 1 + extra_depth
+    # so that neither the transparent container nor a singleton non-transparent
+    # wrapper (e.g. a lone Class in a C# file) consumes the user's depth budget.
+    extra_depth = _count_singleton_wrapper_depth(children, child_inclusion_predicate)
+    effective_depth = depth + 1 + extra_depth
     return [
         symbol.to_dict(
             name_path=False,
