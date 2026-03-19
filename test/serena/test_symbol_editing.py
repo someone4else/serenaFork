@@ -24,7 +24,7 @@ from syrupy import SnapshotAssertion
 from serena.code_editor import CodeEditor, LanguageServerCodeEditor
 from solidlsp.ls_config import Language
 from src.serena.symbol import LanguageServerSymbolRetriever
-from test.conftest import get_repo_path, project_with_ls_context
+from test.conftest import get_repo_path, language_tests_enabled, project_with_ls_context
 
 pytestmark = pytest.mark.snapshot
 
@@ -461,6 +461,7 @@ class NixAttrReplacementTest(EditingTest):
 
 @pytest.mark.nix
 @pytest.mark.skipif(sys.platform == "win32", reason="nixd language server doesn't run on Windows")
+@pytest.mark.skipif(not language_tests_enabled(Language.NIX), reason="Nix is not available")
 def test_nix_symbol_replacement_no_double_semicolon(snapshot: SnapshotAssertion):
     """
     Test that replacing a Nix attribute does not result in double semicolons.

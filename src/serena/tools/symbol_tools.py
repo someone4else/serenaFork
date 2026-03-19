@@ -20,6 +20,10 @@ from solidlsp.ls_types import SymbolKind
 # and provide no useful information at depth=0 on their own.
 _TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Module, SymbolKind.Package})
 
+# Symbol kinds for which the LSP 'detail' field (e.g. the function signature) should be
+# appended to the name in the symbols overview output.
+_DETAIL_INCLUDED_KINDS = frozenset({SymbolKind.Method, SymbolKind.Function, SymbolKind.Constructor})
+
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
     """Restarts the language server, may be necessary when edits not through Serena happen."""
@@ -130,6 +134,66 @@ def _count_singleton_wrapper_depth(
     return 1
 
 
+def _enhance_symbol_dict(
+    symbol: LanguageServerSymbol,
+    output_dict: LanguageServerSymbol.OutputDict,
+    child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
+    parent_symbol: LanguageServerSymbol | None = None,
+) -> None:
+    """
+    Recursively enhances an OutputDict (produced by ``to_dict``) in-place with:
+
+    1. **Signatures** – for callable symbols (Method, Function, Constructor) the LSP
+       ``detail`` field (e.g. ``(int a, int b): int``) is appended to the ``name``
+       entry so the LLM sees full signatures instead of bare names.
+
+    2. **Constructor detection** – in C# (and similar OO languages) the language
+       server returns constructors as ``Method`` symbols whose name matches the
+       enclosing class name.  This function relabels those entries to
+       ``kind="Constructor"`` so the LLM can distinguish them from regular methods.
+
+    The function walks the *symbol* tree (``LanguageServerSymbol``) in parallel with
+    the *dict* tree so that each enhancement is applied with access to the full
+    symbol metadata (including the LSP ``detail`` field and the parent reference).
+
+    :param symbol: the ``LanguageServerSymbol`` whose data was used to build
+        ``output_dict``.
+    :param output_dict: the dict produced by ``symbol.to_dict()``, modified in-place.
+    :param child_inclusion_predicate: the same predicate that was passed to
+        ``to_dict`` so that the child symbol list matches the ``children`` list in
+        the dict.
+    :param parent_symbol: the parent ``LanguageServerSymbol``, used for constructor
+        detection (``None`` for root-level symbols).
+    """
+    # --- 1. Append LSP detail (signature) to the name for callable kinds ---
+    if symbol.symbol_kind in _DETAIL_INCLUDED_KINDS:
+        detail: str = symbol.symbol_root.get("detail", "") or ""
+        if detail and "name" in output_dict:
+            output_dict["name"] = f"{symbol.name} {detail}"
+
+    # --- 2. Detect C# constructors and relabel them ---
+    # C# constructors are emitted as Method symbols with the same name as the
+    # enclosing class.  We relabel them as "Constructor" for clarity.
+    if (
+        symbol.symbol_kind == SymbolKind.Method
+        and "kind" in output_dict
+        and parent_symbol is not None
+        and parent_symbol.symbol_kind == SymbolKind.Class
+        and parent_symbol.name == symbol.name
+    ):
+        output_dict["kind"] = "Constructor"
+
+    # --- 3. Recurse into children ---
+    if "children" not in output_dict:
+        return
+    child_dicts = output_dict["children"]
+    # The child dicts correspond 1-to-1 (in order) to the children that passed the
+    # inclusion predicate, because to_dict() builds them in iteration order.
+    child_symbols = [c for c in symbol.iter_children() if child_inclusion_predicate(c)]
+    for child_sym, child_dict in zip(child_symbols, child_dicts, strict=True):
+        _enhance_symbol_dict(child_sym, child_dict, child_inclusion_predicate, parent_symbol=symbol)
+
+
 def _flatten_transparent_containers_to_dicts(
     symbol: LanguageServerSymbol,
     depth: int,
@@ -158,18 +222,18 @@ def _flatten_transparent_containers_to_dicts(
     For all other symbols the behaviour is identical to the original code.
     """
     if symbol.symbol_kind not in _TRANSPARENT_CONTAINER_KINDS:
-        # Normal symbol - emit as before
-        return [
-            symbol.to_dict(
-                name_path=False,
-                name=True,
-                depth=depth,
-                kind=True,
-                relative_path=False,
-                location=False,
-                child_inclusion_predicate=child_inclusion_predicate,
-            )
-        ]
+        # Normal symbol - emit as before, then apply enhancements
+        output_dict = symbol.to_dict(
+            name_path=False,
+            name=True,
+            depth=depth,
+            kind=True,
+            relative_path=False,
+            location=False,
+            child_inclusion_predicate=child_inclusion_predicate,
+        )
+        _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate)
+        return [output_dict]
 
     # --- Transparent container handling ---
 
@@ -191,17 +255,17 @@ def _flatten_transparent_containers_to_dicts(
     # wrapper (e.g. a lone Class in a C# file) consumes the user's depth budget.
     extra_depth = _count_singleton_wrapper_depth(children, child_inclusion_predicate)
     effective_depth = depth + 1 + extra_depth
-    return [
-        symbol.to_dict(
-            name_path=False,
-            name=True,
-            depth=effective_depth,
-            kind=True,
-            relative_path=False,
-            location=False,
-            child_inclusion_predicate=child_inclusion_predicate,
-        )
-    ]
+    output_dict = symbol.to_dict(
+        name_path=False,
+        name=True,
+        depth=effective_depth,
+        kind=True,
+        relative_path=False,
+        location=False,
+        child_inclusion_predicate=child_inclusion_predicate,
+    )
+    _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate)
+    return [output_dict]
 
 
 class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
