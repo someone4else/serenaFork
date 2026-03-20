@@ -2,10 +2,11 @@
 Language server-related tools
 """
 
-import logging
+from __future__ import annotations
+
 import os
-import re
 from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 from serena.symbol import LanguageServerSymbol, LanguageServerSymbolDictGrouper
 from serena.tools import (
@@ -17,7 +18,8 @@ from serena.tools import (
 from serena.tools.tools_base import ToolMarkerOptional
 from solidlsp.ls_types import SymbolKind
 
-log = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from solidlsp.ls import SolidLanguageServer
 
 # Symbol kinds that are purely structural containers (namespaces, modules, packages).
 # In languages like C#/Java these wrap the "real" symbols (classes, interfaces, etc.)
@@ -28,25 +30,9 @@ _TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Modul
 # symbols overview output. For callables this is the signature (e.g. "(int a, int b): int").
 _DETAIL_INCLUDED_KINDS = frozenset({SymbolKind.Method, SymbolKind.Function, SymbolKind.Constructor})
 
-# Symbol kinds for which hover-based information (e.g. inheritance) should be retrieved
-# and appended to the name in the symbols overview output.
-_HOVER_ENRICHED_KINDS = frozenset({SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct})
-
-
-def _hover_key(symbol: LanguageServerSymbol) -> str:
-    """Return a stable string key for a symbol, used for hover-info dict lookups.
-
-    ``request_info_for_symbol_batch`` returns a ``dict[LanguageServerSymbol, ...]``
-    whose keys are the *same objects* that were passed in.  Using object identity
-    for lookup is fragile: any future refactor that rebuilds the symbol tree between
-    the batch call and the lookup would silently drop all hover data.  This helper
-    produces a stable, human-readable key based on observable symbol properties so
-    that the hover-info dict remains correct regardless of object identity.
-
-    :param symbol: the symbol to produce a key for
-    :return: a string of the form ``"<name>|<kind>|<line>"``
-    """
-    return f"{symbol.name}|{SymbolKind(symbol.symbol_kind).name}|{symbol.line}"
+# Symbol kinds for which Type Hierarchy API-based inheritance info should be retrieved
+# and appended to the name in the symbols overview output (C# only).
+_TYPE_HIERARCHY_KINDS = frozenset({SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct})
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -92,6 +78,8 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         :param depth: the depth up to which descendants shall be retrieved
         :return: a list of symbol dictionaries representing the symbol overview of the file
         """
+        from solidlsp.ls_config import Language
+
         symbol_retriever = self.create_language_server_symbol_retriever()
 
         # The symbol overview is capable of working with both files and directories,
@@ -111,12 +99,13 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         def child_inclusion_predicate(s: LanguageServerSymbol) -> bool:
             return not s.is_low_level()
 
-        # Batch hover requests for Class/Interface/Struct symbols to retrieve inheritance info.
-        hover_symbols = _collect_symbols_for_hover(symbols, child_inclusion_predicate)
-        hover_info: dict[str, str | None] | None = None
-        if hover_symbols:
-            raw_hover = symbol_retriever.request_info_for_symbol_batch(hover_symbols)
-            hover_info = {_hover_key(sym): text for sym, text in raw_hover.items()}
+        # Use the Type Hierarchy API to collect inheritance info (C# only).
+        inheritance_info: dict[str, str] | None = None
+        if Language.CSHARP in self.agent.get_active_lsp_languages():
+            th_symbols = _collect_type_hierarchy_symbols(symbols, child_inclusion_predicate)
+            if th_symbols:
+                lang_server = symbol_retriever.get_language_server(relative_path)
+                inheritance_info = _get_inheritance_info(th_symbols, relative_path, lang_server)
 
         symbol_dicts: list[LanguageServerSymbol.OutputDict] = []
         for symbol in symbols:
@@ -125,59 +114,79 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
                     symbol,
                     depth=depth,
                     child_inclusion_predicate=child_inclusion_predicate,
-                    hover_info=hover_info,
+                    inheritance_info=inheritance_info,
                 )
             )
         return symbol_dicts
 
 
-def _collect_symbols_for_hover(
+def _collect_type_hierarchy_symbols(
     symbols: list[LanguageServerSymbol],
     child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
 ) -> list[LanguageServerSymbol]:
     """Recursively collect all Class/Interface/Struct symbols from the symbol tree.
 
-    These are the symbols for which hover-based inheritance info will be requested.
-    Only symbols passing the inclusion predicate are visited/collected.
+    These are the symbols for which Type Hierarchy API-based inheritance info will be
+    requested (C# only).  Only symbols passing the inclusion predicate are visited.
 
     :param symbols: list of top-level (or current-level) symbols to inspect
     :param child_inclusion_predicate: predicate that filters which children are traversed
-    :return: flat list of symbols whose kind is in ``_HOVER_ENRICHED_KINDS``
+    :return: flat list of symbols whose kind is in ``_TYPE_HIERARCHY_KINDS``
     """
     result: list[LanguageServerSymbol] = []
     for sym in symbols:
-        if sym.symbol_kind in _HOVER_ENRICHED_KINDS:
+        if sym.symbol_kind in _TYPE_HIERARCHY_KINDS:
             result.append(sym)
         children = [c for c in sym.iter_children() if child_inclusion_predicate(c)]
-        result.extend(_collect_symbols_for_hover(children, child_inclusion_predicate))
+        result.extend(_collect_type_hierarchy_symbols(children, child_inclusion_predicate))
     return result
 
 
-def _extract_inheritance_from_hover(hover_text: str) -> str | None:
-    """Extract the C#-style inheritance suffix from hover text.
+def _get_inheritance_info(
+    symbols: list[LanguageServerSymbol],
+    relative_path: str,
+    lang_server: "SolidLanguageServer",
+) -> dict[str, str]:
+    """Build an inheritance info dict for the given Class/Interface/Struct symbols using
+    the LSP Type Hierarchy API (``textDocument/prepareTypeHierarchy`` +
+    ``typeHierarchy/supertypes``).
 
-    Given hover text like ``class MyClass : BaseClass, IInterface``, returns
-    ``: BaseClass, IInterface``.  Returns ``None`` if no inheritance marker is found.
+    For each symbol the result maps the stable key ``"<name>|<kind>|<line>"`` to a
+    ``: SuperType1, SuperType2`` suffix string.  Symbols with no supertypes (or for
+    which the language server returns no data) are omitted from the dict.
 
-    Only the first non-empty line of the (stripped) hover text is examined, so
-    multi-line docstrings or signatures do not pollute the result.
-
-    :param hover_text: raw hover text returned by the language server
-    :return: the inheritance suffix (e.g. ``: BaseClass, IInterface``) or ``None``
+    :param symbols: Class/Interface/Struct symbols to enrich
+    :param relative_path: relative path to the source file (used to open the file buffer)
+    :param lang_server: the ``SolidLanguageServer`` instance for this file
+    :return: dict mapping stable symbol keys to inheritance suffix strings
     """
-    # Strip markdown code fences (e.g. ```csharp\n...\n```)
-    text = re.sub(r"```[^\n]*\n?", "", hover_text)
-    for raw_line in text.split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        # Find the C#-style ' : ' inheritance marker
-        idx = line.find(" : ")
-        if idx != -1:
-            return line[idx:].strip()
-        # Only inspect the very first non-empty line
-        break
-    return None
+    inheritance: dict[str, str] = {}
+    try:
+        with lang_server.open_file(relative_path) as file_buffer:
+            for sym in symbols:
+                if sym.line is None or sym.column is None:
+                    continue
+                key = f"{sym.name}|{SymbolKind(sym.symbol_kind).name}|{sym.line}"
+                try:
+                    th_items = lang_server.server.send.prepare_type_hierarchy(
+                        {
+                            "textDocument": {"uri": file_buffer.uri},
+                            "position": {"line": sym.line, "character": sym.column},
+                        }
+                    )
+                    if not th_items:
+                        continue
+                    th_item = th_items[0]
+                    supertypes = lang_server.server.send.type_hierarchy_supertypes({"item": th_item})
+                    if supertypes:
+                        names = [st["name"] for st in supertypes]
+                        if names:
+                            inheritance[key] = ": " + ", ".join(names)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return inheritance
 
 
 def _count_singleton_wrapper_depth(
@@ -220,7 +229,7 @@ def _enhance_symbol_dict(
     output_dict: LanguageServerSymbol.OutputDict,
     child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
     parent_symbol: LanguageServerSymbol | None = None,
-    hover_info: dict[str, str | None] | None = None,
+    inheritance_info: dict[str, str] | None = None,
 ) -> None:
     """
     Recursively enhances an OutputDict (produced by ``to_dict``) in-place with:
@@ -229,9 +238,9 @@ def _enhance_symbol_dict(
        ``detail`` field (e.g. ``(int a, int b): int``) is appended to the ``name``
        entry so the LLM sees full signatures instead of bare names.
 
-    2. **Inheritance info** – for Class/Interface/Struct symbols the hover text
-       (pre-fetched via ``request_info_for_symbol_batch``) is parsed to extract
-       the C#-style ``: BaseClass, IInterface`` suffix and appended to the name.
+    2. **Inheritance info** – for Class/Interface/Struct symbols the pre-fetched
+       Type Hierarchy API result (C# only) is appended to the name as a
+       ``: BaseClass, IInterface`` suffix.
 
     3. **Constructor detection** – in C# (and similar OO languages) the language
        server returns constructors as ``Method`` symbols whose name matches the
@@ -251,8 +260,9 @@ def _enhance_symbol_dict(
         the dict.
     :param parent_symbol: the parent ``LanguageServerSymbol``, used for constructor
         detection (``None`` for root-level symbols).
-    :param hover_info: optional pre-fetched hover info dict (string key → text), used to
-        enrich Class/Interface/Struct symbols with inheritance information.
+    :param inheritance_info: optional pre-fetched Type Hierarchy inheritance dict
+        (stable key → ``: SuperType1, SuperType2`` suffix), used to enrich
+        Class/Interface/Struct symbols with inheritance information (C# only).
     """
     # --- 1. Append LSP detail (signature) to the name for callable kinds ---
     if symbol.symbol_kind in _DETAIL_INCLUDED_KINDS:
@@ -260,13 +270,12 @@ def _enhance_symbol_dict(
         if detail and "name" in output_dict:
             output_dict["name"] = f"{symbol.name} {detail}"
 
-    # --- 2. Append hover-based inheritance info for Class/Interface/Struct ---
-    elif symbol.symbol_kind in _HOVER_ENRICHED_KINDS and hover_info is not None:
-        info = hover_info.get(_hover_key(symbol))
-        if info:
-            inheritance = _extract_inheritance_from_hover(info)
-            if inheritance and "name" in output_dict:
-                output_dict["name"] = f"{symbol.name} {inheritance}"
+    # --- 2. Append Type Hierarchy inheritance info for Class/Interface/Struct ---
+    elif symbol.symbol_kind in _TYPE_HIERARCHY_KINDS and inheritance_info is not None:
+        key = f"{symbol.name}|{SymbolKind(symbol.symbol_kind).name}|{symbol.line}"
+        suffix = inheritance_info.get(key)
+        if suffix and "name" in output_dict:
+            output_dict["name"] = f"{symbol.name} {suffix}"
 
     # --- 3. Detect C# constructors and relabel them ---
     # C# constructors are emitted as Method symbols with the same name as the
@@ -288,14 +297,14 @@ def _enhance_symbol_dict(
     # inclusion predicate, because to_dict() builds them in iteration order.
     child_symbols = [c for c in symbol.iter_children() if child_inclusion_predicate(c)]
     for child_sym, child_dict in zip(child_symbols, child_dicts, strict=True):
-        _enhance_symbol_dict(child_sym, child_dict, child_inclusion_predicate, parent_symbol=symbol, hover_info=hover_info)
+        _enhance_symbol_dict(child_sym, child_dict, child_inclusion_predicate, parent_symbol=symbol, inheritance_info=inheritance_info)
 
 
 def _flatten_transparent_containers_to_dicts(
     symbol: LanguageServerSymbol,
     depth: int,
     child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
-    hover_info: dict[str, str | None] | None = None,
+    inheritance_info: dict[str, str] | None = None,
 ) -> list[LanguageServerSymbol.OutputDict]:
     """
     Converts a symbol to one or more OutputDicts, automatically "seeing through"
@@ -330,7 +339,7 @@ def _flatten_transparent_containers_to_dicts(
             location=False,
             child_inclusion_predicate=child_inclusion_predicate,
         )
-        _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate, hover_info=hover_info)
+        _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate, inheritance_info=inheritance_info)
         return [output_dict]
 
     # --- Transparent container handling ---
@@ -346,7 +355,7 @@ def _flatten_transparent_containers_to_dicts(
             children[0],
             depth=depth,
             child_inclusion_predicate=child_inclusion_predicate,
-            hover_info=hover_info,
+            inheritance_info=inheritance_info,
         )
 
     # The container has substantive children - emit it with depth + 1 + extra_depth
@@ -363,7 +372,7 @@ def _flatten_transparent_containers_to_dicts(
         location=False,
         child_inclusion_predicate=child_inclusion_predicate,
     )
-    _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate, hover_info=hover_info)
+    _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate, inheritance_info=inheritance_info)
     return [output_dict]
 
 
