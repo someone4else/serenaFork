@@ -26,23 +26,27 @@ _TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Modul
 
 # Symbol kinds for which the LSP 'detail' field should be appended to the name in the
 # symbols overview output. For callables this is the signature (e.g. "(int a, int b): int").
-_DETAIL_INCLUDED_KINDS = frozenset(
-    {
-        SymbolKind.Method,
-        SymbolKind.Function,
-        SymbolKind.Constructor,
-    }
-)
+_DETAIL_INCLUDED_KINDS = frozenset({SymbolKind.Method, SymbolKind.Function, SymbolKind.Constructor})
 
 # Symbol kinds for which hover-based information (e.g. inheritance) should be retrieved
 # and appended to the name in the symbols overview output.
-_HOVER_ENRICHED_KINDS = frozenset(
-    {
-        SymbolKind.Class,
-        SymbolKind.Interface,
-        SymbolKind.Struct,
-    }
-)
+_HOVER_ENRICHED_KINDS = frozenset({SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct})
+
+
+def _hover_key(symbol: LanguageServerSymbol) -> str:
+    """Return a stable string key for a symbol, used for hover-info dict lookups.
+
+    ``request_info_for_symbol_batch`` returns a ``dict[LanguageServerSymbol, ...]``
+    whose keys are the *same objects* that were passed in.  Using object identity
+    for lookup is fragile: any future refactor that rebuilds the symbol tree between
+    the batch call and the lookup would silently drop all hover data.  This helper
+    produces a stable, human-readable key based on observable symbol properties so
+    that the hover-info dict remains correct regardless of object identity.
+
+    :param symbol: the symbol to produce a key for
+    :return: a string of the form ``"<name>|<kind>|<line>"``
+    """
+    return f"{symbol.name}|{symbol.symbol_kind.name}|{symbol.line}"
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -109,9 +113,10 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
 
         # Batch hover requests for Class/Interface/Struct symbols to retrieve inheritance info.
         hover_symbols = _collect_symbols_for_hover(symbols, child_inclusion_predicate)
-        hover_info: dict[LanguageServerSymbol, str | None] | None = None
+        hover_info: dict[str, str | None] | None = None
         if hover_symbols:
-            hover_info = symbol_retriever.request_info_for_symbol_batch(hover_symbols)
+            raw_hover = symbol_retriever.request_info_for_symbol_batch(hover_symbols)
+            hover_info = {_hover_key(sym): text for sym, text in raw_hover.items()}
 
         symbol_dicts: list[LanguageServerSymbol.OutputDict] = []
         for symbol in symbols:
@@ -215,7 +220,7 @@ def _enhance_symbol_dict(
     output_dict: LanguageServerSymbol.OutputDict,
     child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
     parent_symbol: LanguageServerSymbol | None = None,
-    hover_info: dict[LanguageServerSymbol, str | None] | None = None,
+    hover_info: dict[str, str | None] | None = None,
 ) -> None:
     """
     Recursively enhances an OutputDict (produced by ``to_dict``) in-place with:
@@ -246,22 +251,9 @@ def _enhance_symbol_dict(
         the dict.
     :param parent_symbol: the parent ``LanguageServerSymbol``, used for constructor
         detection (``None`` for root-level symbols).
-    :param hover_info: optional pre-fetched hover info dict (symbol → text), used to
+    :param hover_info: optional pre-fetched hover info dict (string key → text), used to
         enrich Class/Interface/Struct symbols with inheritance information.
     """
-    # === TEMPORARY DEBUG LOGGING — remove after diagnosis ===
-    detail_raw = symbol.symbol_root.get("detail", "")
-    kind_name = symbol.symbol_kind.name if hasattr(symbol.symbol_kind, "name") else str(symbol.symbol_kind)
-    log.debug("[DEBUG_HOVER] Symbol: %s, Kind: %s, Detail: %r", symbol.name, kind_name, detail_raw)
-    if symbol.symbol_kind in (SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct):
-        root_keys = list(symbol.symbol_root.keys()) if isinstance(symbol.symbol_root, dict) else "N/A"
-        log.debug("[DEBUG_HOVER]   Class/Interface/Struct root keys: %s", root_keys)
-        log.debug("[DEBUG_HOVER]   Full symbol_root (truncated): %s", str(symbol.symbol_root)[:500])
-    if hover_info is not None and symbol.symbol_kind in (SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct):
-        raw_hover = hover_info.get(symbol)
-        log.debug("[DEBUG_HOVER]   Hover text (truncated): %r", str(raw_hover)[:500])
-    # === END TEMPORARY DEBUG LOGGING ===
-
     # --- 1. Append LSP detail (signature) to the name for callable kinds ---
     if symbol.symbol_kind in _DETAIL_INCLUDED_KINDS:
         detail: str = symbol.symbol_root.get("detail", "") or ""
@@ -270,7 +262,7 @@ def _enhance_symbol_dict(
 
     # --- 2. Append hover-based inheritance info for Class/Interface/Struct ---
     elif symbol.symbol_kind in _HOVER_ENRICHED_KINDS and hover_info is not None:
-        info = hover_info.get(symbol)
+        info = hover_info.get(_hover_key(symbol))
         if info:
             inheritance = _extract_inheritance_from_hover(info)
             if inheritance and "name" in output_dict:
@@ -303,7 +295,7 @@ def _flatten_transparent_containers_to_dicts(
     symbol: LanguageServerSymbol,
     depth: int,
     child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
-    hover_info: dict[LanguageServerSymbol, str | None] | None = None,
+    hover_info: dict[str, str | None] | None = None,
 ) -> list[LanguageServerSymbol.OutputDict]:
     """
     Converts a symbol to one or more OutputDicts, automatically "seeing through"
