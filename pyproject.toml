@@ -54,7 +54,7 @@ text = "MIT"
 
 [project.optional-dependencies]
 dev = [
-  "black[jupyter]>=23.7.0, <26",  # black 26 is incompatible with our pathspec version
+  "black[jupyter]>=26.3.1",
   "jinja2",
   # In version 1.0.4 we get a NoneType error related to some config conversion (yml_analytics is None and should be a list)
   "mypy>=1.16.1",
@@ -338,3 +338,11 @@ skip = '.git*,*.svg,*.lock,*.min.*'
 check-hidden = true
 ignore-regex = '\.\w+'
 ignore-words-list = 'paket'
+
+[dependency-groups]
+dev = [
+    "black>=26.3.1",
+    "mypy>=1.17.0",
+    "poethepoet>=0.36.0",
+    "ruff>=0.12.5",
+]
