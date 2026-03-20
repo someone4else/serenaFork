@@ -7,7 +7,6 @@ import pytest
 
 from serena.ls_manager import LanguageServerManager
 from serena.symbol import LanguageServerSymbolRetriever
-from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
 from test.conftest import get_repo_path, start_ls_context
 
@@ -16,7 +15,9 @@ log = logging.getLogger(__name__)
 
 @pytest.mark.python
 @pytest.mark.typescript
-@pytest.mark.xfail(reason="LanguageServerSymbolRetriever constructor expects Project, not LanguageServerManager; tests need to be updated to use project_context")
+@pytest.mark.xfail(
+    reason="LanguageServerSymbolRetriever constructor expects Project, not LanguageServerManager; tests need to be updated to use project_context"
+)
 class TestMultiLanguageSymbolRetrieval:
     """Test that symbol retrieval optimizes language server queries in multi-LS setups."""
 

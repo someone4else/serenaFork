@@ -23,15 +23,23 @@ _TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Modul
 
 # Symbol kinds for which the LSP 'detail' field should be appended to the name in the
 # symbols overview output. For callables this is the signature (e.g. "(int a, int b): int").
-_DETAIL_INCLUDED_KINDS = frozenset({
-    SymbolKind.Method, SymbolKind.Function, SymbolKind.Constructor,
-})
+_DETAIL_INCLUDED_KINDS = frozenset(
+    {
+        SymbolKind.Method,
+        SymbolKind.Function,
+        SymbolKind.Constructor,
+    }
+)
 
 # Symbol kinds for which hover-based information (e.g. inheritance) should be retrieved
 # and appended to the name in the symbols overview output.
-_HOVER_ENRICHED_KINDS = frozenset({
-    SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct,
-})
+_HOVER_ENRICHED_KINDS = frozenset(
+    {
+        SymbolKind.Class,
+        SymbolKind.Interface,
+        SymbolKind.Struct,
+    }
+)
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -193,7 +201,7 @@ def _count_singleton_wrapper_depth(
     # Check whether the sole non-transparent child itself has visible descendants.
     has_grandchildren = any(child_inclusion_predicate(c) for c in only_child.iter_children())
     if not has_grandchildren:
-        return 0  # Leaf symbol – no extra depth needed.
+        return 0  # Leaf symbol - no extra depth needed.
 
     # The single non-transparent child (e.g. a Class) acts as a wrapper → +1.
     return 1
