@@ -46,7 +46,7 @@ def _hover_key(symbol: LanguageServerSymbol) -> str:
     :param symbol: the symbol to produce a key for
     :return: a string of the form ``"<name>|<kind>|<line>"``
     """
-    return f"{symbol.name}|{symbol.symbol_kind.name}|{symbol.line}"
+    return f"{symbol.name}|{SymbolKind(symbol.symbol_kind).name}|{symbol.line}"
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
