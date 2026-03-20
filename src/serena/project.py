@@ -636,7 +636,7 @@ class Project(ToStringMixin):
         if self.language_server_manager is None:
             msg = TextBuilder("The language server manager is not initialized, indicating a problem during project initialisation.")
             if self._language_server_manager_init_error is not None:
-                msg.with_text(str(self._lsp_init_error))
+                msg.with_text(str(self._language_server_manager_init_error))
             msg.with_text("For details, please check the logs. " + self.get_log_inspection_instructions())
             msg.with_text(
                 "IMPORTANT: Stop, do not attempt workarounds. Inform the user and wait for further instructions before you continue!"
