@@ -6,6 +6,7 @@ import pytest
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
 from solidlsp.ls_utils import SymbolUtils
+from test.conftest import language_tests_enabled
 
 
 @pytest.mark.go
@@ -40,6 +41,7 @@ def _filter_symbols_by_name_in_repo(symbols: list | None, target_name: str, repo
 
 
 @pytest.mark.go
+@pytest.mark.skipif(not language_tests_enabled(Language.GO), reason="gopls is not available")
 class TestGoBuildTags:
     """Tests for Go build tag/constraint support."""
 

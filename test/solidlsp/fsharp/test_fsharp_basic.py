@@ -11,6 +11,7 @@ from test.conftest import is_ci
 
 
 @pytest.mark.fsharp
+@pytest.mark.xfail(reason="F# language server is unreliable")
 class TestFSharpLanguageServer:
     @pytest.mark.parametrize("language_server", [Language.FSHARP], indirect=True)
     def test_find_symbol(self, language_server: SolidLanguageServer) -> None:
