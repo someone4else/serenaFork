@@ -2,6 +2,7 @@
 Language server-related tools
 """
 
+import logging
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -15,6 +16,8 @@ from serena.tools import (
 )
 from serena.tools.tools_base import ToolMarkerOptional
 from solidlsp.ls_types import SymbolKind
+
+log = logging.getLogger(__name__)
 
 # Symbol kinds that are purely structural containers (namespaces, modules, packages).
 # In languages like C#/Java these wrap the "real" symbols (classes, interfaces, etc.)
@@ -246,6 +249,19 @@ def _enhance_symbol_dict(
     :param hover_info: optional pre-fetched hover info dict (symbol → text), used to
         enrich Class/Interface/Struct symbols with inheritance information.
     """
+    # === TEMPORARY DEBUG LOGGING — remove after diagnosis ===
+    detail_raw = symbol.symbol_root.get("detail", "")
+    kind_name = symbol.symbol_kind.name if hasattr(symbol.symbol_kind, "name") else str(symbol.symbol_kind)
+    log.debug("[DEBUG_HOVER] Symbol: %s, Kind: %s, Detail: %r", symbol.name, kind_name, detail_raw)
+    if symbol.symbol_kind in (SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct):
+        root_keys = list(symbol.symbol_root.keys()) if isinstance(symbol.symbol_root, dict) else "N/A"
+        log.debug("[DEBUG_HOVER]   Class/Interface/Struct root keys: %s", root_keys)
+        log.debug("[DEBUG_HOVER]   Full symbol_root (truncated): %s", str(symbol.symbol_root)[:500])
+    if hover_info is not None and symbol.symbol_kind in (SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct):
+        raw_hover = hover_info.get(symbol)
+        log.debug("[DEBUG_HOVER]   Hover text (truncated): %r", str(raw_hover)[:500])
+    # === END TEMPORARY DEBUG LOGGING ===
+
     # --- 1. Append LSP detail (signature) to the name for callable kinds ---
     if symbol.symbol_kind in _DETAIL_INCLUDED_KINDS:
         detail: str = symbol.symbol_root.get("detail", "") or ""
