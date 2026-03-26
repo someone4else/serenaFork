@@ -13,7 +13,7 @@ import docstring_parser
 from mcp.server.fastmcp import server
 from mcp.server.fastmcp.server import FastMCP, Settings
 from mcp.server.fastmcp.tools.base import Tool as MCPTool
-from mcp.types import ToolAnnotations
+from mcp.types import TextContent, ToolAnnotations
 from pydantic_settings import SettingsConfigDict
 from sensai.util import logging
 
@@ -218,8 +218,9 @@ class SerenaMCPFactory:
                 param_desc = f"{param_doc.description.strip().strip('.') + '.'}"
                 properties["description"] = param_desc[0].upper() + param_desc[1:]
 
-        def execute_fn(**kwargs) -> str:  # type: ignore
-            return tool.apply_ex(log_call=True, catch_exceptions=True, **kwargs)
+        def execute_fn(**kwargs: Any) -> list[TextContent]:
+            result = tool.apply_ex(log_call=True, catch_exceptions=True, **kwargs)
+            return [TextContent(type="text", text=result)]
 
         # Generate human-readable title from snake_case tool name
         tool_title = " ".join(word.capitalize() for word in func_name.split("_"))

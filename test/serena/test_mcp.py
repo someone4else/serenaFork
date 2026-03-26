@@ -2,6 +2,7 @@
 
 import pytest
 from mcp.server.fastmcp.tools.base import Tool as MCPTool
+from mcp.types import TextContent
 
 from serena.agent import Tool, ToolRegistry
 from serena.config.context_mode import SerenaAgentContext
@@ -78,7 +79,10 @@ def test_make_tool_execution() -> None:
     # Execute the MCP tool function
     result = mcp_tool.fn(name="Alice", age=30)
 
-    assert result == "Hello Alice, you are 30 years old!"
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert isinstance(result[0], TextContent)
+    assert result[0].text == "Hello Alice, you are 30 years old!"
 
 
 def test_make_tool_no_params() -> None:
