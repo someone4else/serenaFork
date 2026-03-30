@@ -207,7 +207,7 @@ class Tool(Component):
             if apply_fn is None:
                 raise AttributeError(f"apply method not defined in {cls}. Did you forget to implement it?")
 
-        return func_metadata(apply_fn, skip_names=["self", "cls"])
+        return func_metadata(apply_fn, skip_names=["self", "cls"], structured_output=False)
 
     def _log_tool_application(self, frame: Any) -> None:
         params = {}
