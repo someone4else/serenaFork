@@ -11,8 +11,14 @@ from bs4 import BeautifulSoup
 from joblib import Parallel, delayed
 
 from serena.constants import DEFAULT_SOURCE_FILE_ENCODING
+from solidlsp.ls_utils import FileUtils
 
 log = logging.getLogger(__name__)
+
+# Upper bound on the size of a file that the text search will read into memory. Files larger than
+# this are almost never source code we want to grep (data dumps, bundled/minified assets, ...),
+# and loading them would waste memory and CPU. The limit is deliberately generous.
+MAX_SEARCHABLE_FILE_SIZE = 20 * 1024 * 1024
 
 
 class LineType(StrEnum):
@@ -369,6 +375,22 @@ def search_files(
         """Process a single file - this function will be parallelized."""
         try:
             abs_path = os.path.join(root_path, path)
+            # Skip files that are pointless (and expensive) to search before reading them into
+            # memory: a text search can never match inside a binary file, and very large files
+            # are almost never source code. Both checks read at most a small header / a stat, so
+            # we avoid loading e.g. compiled assemblies or multi-megabyte data blobs in full.
+            # If the size cannot be determined (e.g. the path does not exist), fall through and
+            # let the file reader surface the error, preserving the previous behavior.
+            try:
+                too_large = os.path.getsize(abs_path) > MAX_SEARCHABLE_FILE_SIZE
+            except OSError:
+                too_large = False
+            if too_large:
+                log.debug(f"Skipping {path}: exceeds max searchable file size")
+                return {"path": path, "results": [], "error": None}
+            if FileUtils.is_binary_file(abs_path):
+                log.debug(f"Skipping {path}: binary file")
+                return {"path": path, "results": [], "error": None}
             file_content = file_reader(abs_path)
             search_results = search_text(
                 pattern,

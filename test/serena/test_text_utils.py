@@ -1,3 +1,4 @@
+import os
 import re
 
 import pytest
@@ -575,3 +576,50 @@ class TestExpandBraces:
         from serena.util.text_utils import expand_braces
 
         assert sorted(expand_braces(pattern)) == sorted(expected)
+
+
+class TestSearchFilesResourceSkips:
+    """search_files must not spend resources on files that are useless to search (binary or huge):
+    such files must be skipped without ever being read into memory.
+    """
+
+    def test_binary_and_oversized_files_are_not_read(self, tmp_path, monkeypatch):
+        # Cap the searchable size at a tiny value so the oversized case does not need a huge file.
+        import serena.util.text_utils as text_utils_module
+
+        monkeypatch.setattr(text_utils_module, "MAX_SEARCHABLE_FILE_SIZE", 64)
+
+        # A normal source file with a match.
+        (tmp_path / "a.py").write_text("def foo():\n    return MATCHME\n", encoding="utf-8")
+        # A binary file that even contains the token as raw bytes: it must still be skipped.
+        (tmp_path / "lib.dll").write_bytes(b"MZ\x90\x00" + bytes(range(256)) + b"MATCHME")
+        # An oversized (relative to the patched cap) text file: must be skipped without being read.
+        (tmp_path / "huge.log").write_text("MATCHME " * 100, encoding="utf-8")
+
+        read_paths: list[str] = []
+
+        def recording_reader(abs_path: str) -> str:
+            read_paths.append(os.path.basename(abs_path))
+            with open(abs_path, encoding="utf-8") as f:
+                return f.read()
+
+        matches = search_files(
+            ["a.py", "lib.dll", "huge.log"],
+            "MATCHME",
+            root_path=str(tmp_path),
+            file_reader=recording_reader,
+        )
+
+        assert sorted({m.source_file_path for m in matches}) == ["a.py"]
+        # The useless files were skipped before reading; only the source file was actually read.
+        assert read_paths == ["a.py"]
+
+    def test_missing_file_falls_through_to_reader(self, tmp_path):
+        # A non-existent path must not be skipped by the size pre-check; the reader still decides.
+        matches = search_files(
+            ["does_not_exist.py"],
+            "match",
+            root_path=str(tmp_path),
+            file_reader=mock_reader_always_match,
+        )
+        assert [m.source_file_path for m in matches] == ["does_not_exist.py"]

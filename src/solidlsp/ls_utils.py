@@ -184,6 +184,10 @@ class FileUtils:
         If decoding fails, tries to detect the encoding using charset_normalizer.
         Detected encodings are cached by (file_path, mtime) to avoid redundant analysis.
 
+        Binary files (which cannot be read as text) raise a UnicodeDecodeError without noisy
+        error logging, so that bulk readers such as the project-wide text search can skip them
+        silently instead of flooding the log with benign, expected read failures.
+
         Raises FileNotFoundError if the file does not exist.
         """
         if not os.path.exists(file_path):
@@ -194,6 +198,16 @@ class FileUtils:
                 with open(file_path, encoding=encoding) as inp_file:
                     return inp_file.read()
             except UnicodeDecodeError as ude:
+                # The content is not valid text in the expected encoding. This routinely happens
+                # when a bulk reader (e.g. the project-wide text search) sweeps up binary files
+                # such as compiled assemblies, executables or images. Running charset_normalizer
+                # on those is both futile and expensive (it would scan the whole file), so detect
+                # binary content cheaply and bail out quietly.
+                if FileUtils.is_binary_file(file_path):
+                    log.debug(f"Skipping binary file '{file_path}': cannot be read as text")
+                    raise
+                # Otherwise assume a legacy (non-UTF-8) text encoding and try to detect it,
+                # caching the result per (path, mtime) to avoid repeated, expensive analysis.
                 mtime = os.path.getmtime(file_path)
                 cache_key = (file_path, mtime)
                 with FileUtils._encoding_cache_lock:
@@ -202,25 +216,51 @@ class FileUtils:
                         # move to end to mark as recently used
                         FileUtils._encoding_cache.move_to_end(cache_key)
                 if detected_encoding is None:
-                    results = charset_normalizer.from_path(file_path)
-                    match = results.best()
-                    if match:
-                        detected_encoding = match.encoding
-                        with FileUtils._encoding_cache_lock:
-                            if len(FileUtils._encoding_cache) >= FileUtils._ENCODING_CACHE_MAX_SIZE:
-                                # evict the least recently used entry
-                                FileUtils._encoding_cache.popitem(last=False)
-                            FileUtils._encoding_cache[cache_key] = detected_encoding
-                    else:
+                    match = charset_normalizer.from_path(file_path).best()
+                    if match is None:
+                        # No known text encoding fits; treat it like a binary file and skip quietly.
+                        log.debug(f"Could not detect a text encoding for '{file_path}'; skipping")
                         raise ude
-                log.warning(
-                    f"Could not decode {file_path} with encoding='{encoding}'; using cached/detected encoding '{detected_encoding}' instead",
-                )
+                    detected_encoding = match.encoding
+                    with FileUtils._encoding_cache_lock:
+                        if len(FileUtils._encoding_cache) >= FileUtils._ENCODING_CACHE_MAX_SIZE:
+                            # evict the least recently used entry
+                            FileUtils._encoding_cache.popitem(last=False)
+                        FileUtils._encoding_cache[cache_key] = detected_encoding
+                    # Logged once per (path, mtime), i.e. only when the encoding is first detected,
+                    # so repeated reads of the same non-UTF-8 file do not flood the log.
+                    log.info(f"Read '{file_path}' using detected encoding '{detected_encoding}' instead of '{encoding}'")
                 with open(file_path, encoding=detected_encoding) as inp_file:
                     return inp_file.read()
+        except UnicodeDecodeError:
+            # Expected for binary/undecodable content (already logged at debug above). Re-raise so
+            # callers can skip the file; deliberately not logged at error to avoid flooding the log.
+            raise
         except Exception as exc:
             log.error(f"Failed to read '{file_path}' with encoding '{encoding}': {exc}")
             raise exc
+
+    @staticmethod
+    def is_binary_file(file_path: str, sample_size: int = 8192) -> bool:
+        """
+        Heuristically determine whether a file is binary and therefore cannot (usefully) be read
+        as text. Reads at most ``sample_size`` bytes, so it is cheap enough to call before
+        attempting to load a file, which lets bulk consumers (e.g. the project-wide text search)
+        skip binaries without reading them in full.
+
+        Uses the same approach as git and grep: a NUL byte within the initial chunk indicates
+        binary content. Files starting with a UTF-16/UTF-8 byte-order mark are treated as text
+        even though UTF-16 content contains NUL bytes, so that genuine (BOM-prefixed) text is
+        still read correctly.
+        """
+        try:
+            with open(file_path, "rb") as sample_file:
+                chunk = sample_file.read(sample_size)
+        except OSError:
+            return False
+        if chunk.startswith((b"\xff\xfe", b"\xfe\xff", b"\xef\xbb\xbf")):
+            return False
+        return b"\x00" in chunk
 
     @staticmethod
     def download_file(url: str, target_path: str) -> None:
