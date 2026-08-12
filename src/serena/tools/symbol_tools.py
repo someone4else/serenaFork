@@ -225,6 +225,22 @@ def _extract_inheritance_from_source(symbol: LanguageServerSymbol, project: "Pro
     return None
 
 
+def _detail_repeats_name(name: str, detail: str) -> bool:
+    """
+    :param name: the symbol's name
+    :param detail: the symbol's LSP ``detail`` field
+    :return: whether the detail already starts with the symbol's name, as is the case for language
+        servers that report a full signature (``Add(int, int) : int``) rather than just the
+        parameter/return part (``(int, int) : int``). The character following the name must not be
+        part of an identifier, so that the name "Get" is not considered to be repeated by a detail
+        describing "GetAll".
+    """
+    if not detail.startswith(name):
+        return False
+    remainder = detail[len(name) :]
+    return not remainder or not (remainder[0].isalnum() or remainder[0] == "_")
+
+
 def _count_singleton_wrapper_depth(
     children: list[LanguageServerSymbol],
     child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
@@ -271,7 +287,8 @@ def _enhance_symbol_dict(
 
     1. **Signatures** - for callable symbols (Method, Function, Constructor) the LSP ``detail``
        field (e.g. ``(int a, int b): int``) is appended to the ``name`` entry, so the LM sees full
-       signatures instead of bare names.
+       signatures instead of bare names. Language servers that already repeat the symbol name in
+       the detail (``Add(int, int) : int``) do not get it prepended a second time.
     2. **Inheritance info** - for Class/Interface/Struct symbols the inheritance clause is extracted
        from the source file and appended to the name as a ``: BaseClass, IInterface`` suffix.
     3. **Constructor detection** - in C# (and similar OO languages) the language server returns
@@ -293,7 +310,7 @@ def _enhance_symbol_dict(
     if symbol.symbol_kind in _DETAIL_INCLUDED_KINDS:
         detail: str = symbol.symbol_root.get("detail", "") or ""
         if detail and "name" in output_dict:
-            output_dict["name"] = f"{symbol.name} {detail}"
+            output_dict["name"] = detail if _detail_repeats_name(symbol.name, detail) else f"{symbol.name} {detail}"
 
     # 2. append source-based inheritance info for Class/Interface/Struct
     elif symbol.symbol_kind in _INHERITANCE_ENRICHED_KINDS and project is not None:

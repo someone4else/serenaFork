@@ -192,6 +192,18 @@ class TestSymbolDictEnrichment:
         (result,) = _flatten(root, depth=1)
         assert result["children"][0]["name"] == "Add (int, int) : int"
 
+    def test_detail_that_already_contains_the_name_is_not_duplicated(self):
+        # Some C# servers report the full signature in 'detail' rather than just its tail.
+        root = _symbol("Foo", SymbolKind.Class, [_symbol("Run", SymbolKind.Method, detail="Run(CancellationToken) : Task")])
+        (result,) = _flatten(root, depth=1)
+        assert result["children"][0]["name"] == "Run(CancellationToken) : Task"
+
+    def test_detail_of_a_longer_name_is_still_appended(self):
+        # "Get" is a prefix of "GetAll", but the detail describes a different identifier.
+        root = _symbol("Foo", SymbolKind.Class, [_symbol("Get", SymbolKind.Method, detail="GetAll() : Task")])
+        (result,) = _flatten(root, depth=1)
+        assert result["children"][0]["name"] == "Get GetAll() : Task"
+
     def test_constructor_is_relabelled(self):
         # C# language servers emit constructors as methods named like the enclosing class.
         root = _symbol("Foo", SymbolKind.Class, [_symbol("Foo", SymbolKind.Method), _symbol("Bar", SymbolKind.Method)])
