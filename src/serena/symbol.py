@@ -26,6 +26,16 @@ log = logging.getLogger(__name__)
 NAME_PATH_SEP = "/"
 
 
+class SymbolRetrievalError(ValueError):
+    """Raised when a symbol lookup does not resolve to a unique symbol (no match, or several
+    ambiguous matches). This is an expected, caller-facing condition -- typically a wrong name
+    path or an incorrect ``relative_path`` argument (e.g. pointing at an interface instead of the
+    implementation) -- rather than an internal error. Tools report the message to the caller and
+    log it concisely (without a stack trace). Subclasses ``ValueError`` for backward compatibility
+    with callers that catch it.
+    """
+
+
 @dataclass
 class LanguageServerSymbolLocation:
     """
@@ -782,7 +792,7 @@ class LanguageServerSymbolRetriever:
         if len(symbol_candidates) == 1:
             return symbol_candidates[0]
         elif len(symbol_candidates) == 0:
-            raise ValueError(f"No symbol matching '{name_path_pattern}' found")
+            raise SymbolRetrievalError(f"No symbol matching '{name_path_pattern}' found")
         else:
             # There are multiple candidates.
             # If only one of the candidates has the given pattern as its exact name path, return that one
@@ -791,7 +801,7 @@ class LanguageServerSymbolRetriever:
                 return exact_matches[0]
             # otherwise, raise an error
             include_rel_path = within_relative_path is not None
-            raise ValueError(
+            raise SymbolRetrievalError(
                 f"Found multiple {len(symbol_candidates)} symbols matching '{name_path_pattern}'. "
                 "They are: \n" + json.dumps([s.to_dict(kind=True, relative_path=include_rel_path) for s in symbol_candidates], indent=2)
             )

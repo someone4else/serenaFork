@@ -403,7 +403,17 @@ class Tool(Component):
                 raise
             except Exception as e:
                 msg = f"{e.__class__.__name__}: {e}"
-                log.error(msg, exc_info=e)
+                # Lazy import to avoid an import cycle (serena.symbol imports back into the tools).
+                from serena.symbol import SymbolRetrievalError
+
+                if isinstance(e, SymbolRetrievalError):
+                    # Expected, caller-facing outcome (e.g. a symbol lookup that matched nothing or
+                    # was ambiguous): the message is returned to the caller so it can correct its
+                    # arguments. Log it concisely, without a stack trace, so it is not mistaken for
+                    # an internal error.
+                    log.warning(f"Tool could not complete: {msg}")
+                else:
+                    log.error(msg, exc_info=e)
                 raise ToolCallError(msg)
 
             if log_call:
