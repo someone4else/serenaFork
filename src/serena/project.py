@@ -79,21 +79,31 @@ class Project(ToStringMixin):
     def _gather_ignorespec(self) -> None:
         with LogTime(f"Gathering ignore spec for project {self.project_config.project_name}", logger=log):
             try:
-                # gather ignored paths from the global configuration, project configuration, and gitignore files
+                # Gather ignored paths from the gitignore files first, then from the global and project
+                # configuration. The order matters: pathspec applies "last match wins", so the explicitly
+                # configured ignored_paths are appended last and thereby take precedence over .gitignore
+                # rules. This is important because a .gitignore negation that re-includes a directory
+                # (e.g. "!some/tracked/dir/") would otherwise defeat configured ignores such as
+                # "**/bin/**" for paths inside that directory. Note that git itself keeps such paths
+                # ignored via its directory-level exclusion semantics, which a single flat pathspec
+                # cannot fully reproduce; giving the configuration precedence restores the intended
+                # behavior for the paths users configure explicitly.
+                ignored_patterns: list[str] = []
+                if self.project_config.ignore_all_files_in_gitignore:
+                    gitignore_parser = GitignoreParser(self.project_root)
+                    for spec in gitignore_parser.get_ignore_specs():
+                        log.debug(f"Adding {len(spec.patterns)} patterns from {spec.file_path} to the ignored paths.")
+                        ignored_patterns.extend(spec.patterns)
                 global_ignored_paths = self.serena_config.ignored_paths
-                ignored_patterns = list(global_ignored_paths) + list(self.project_config.ignored_paths)
                 if len(global_ignored_paths) > 0:
                     log.info(f"Using {len(global_ignored_paths)} ignored paths from the global configuration.")
                     log.debug(f"Global ignored paths: {list(global_ignored_paths)}")
                 if len(self.project_config.ignored_paths) > 0:
                     log.info(f"Using {len(self.project_config.ignored_paths)} ignored paths from the project configuration.")
                     log.debug(f"Project ignored paths: {self.project_config.ignored_paths}")
+                ignored_patterns.extend(global_ignored_paths)
+                ignored_patterns.extend(self.project_config.ignored_paths)
                 log.debug(f"Combined ignored patterns: {ignored_patterns}")
-                if self.project_config.ignore_all_files_in_gitignore:
-                    gitignore_parser = GitignoreParser(self.project_root)
-                    for spec in gitignore_parser.get_ignore_specs():
-                        log.debug(f"Adding {len(spec.patterns)} patterns from {spec.file_path} to the ignored paths.")
-                        ignored_patterns.extend(spec.patterns)
                 self.__ignored_patterns = ignored_patterns
 
                 # Set up the pathspec matcher for the ignored paths
