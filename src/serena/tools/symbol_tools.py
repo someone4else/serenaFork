@@ -3,10 +3,12 @@ Language server-related tools
 """
 
 import copy
+import logging
 import os
+import re
 from collections import Counter, defaultdict
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
 from serena.symbol import LanguageServerSymbol, LanguageServerSymbolDictGrouper
 from serena.tools import (
@@ -20,6 +22,29 @@ from serena.tools.tools_base import ToolMarkerOptional
 from serena.util.ls_diagnostics import GroupedDiagnostics
 from serena.util.text_utils import find_text_coordinates
 from solidlsp.ls_types import SymbolKind
+
+if TYPE_CHECKING:
+    from serena.project import Project
+
+log = logging.getLogger(__name__)
+
+# Symbol kinds that are purely structural containers (namespaces, modules, packages).
+# In languages like C#/Java these wrap the "real" symbols (classes, interfaces, etc.)
+# and provide no useful information at depth=0 on their own.
+_TRANSPARENT_CONTAINER_KINDS = frozenset({SymbolKind.Namespace, SymbolKind.Module, SymbolKind.Package})
+
+# Symbol kinds for which the LSP 'detail' field shall be appended to the name in the
+# symbols overview output. For callables this is the signature (e.g. "(int a, int b): int").
+_DETAIL_INCLUDED_KINDS = frozenset({SymbolKind.Method, SymbolKind.Function, SymbolKind.Constructor})
+
+# Symbol kinds for which source-code-based inheritance info shall be extracted
+# and appended to the name in the symbols overview output.
+_INHERITANCE_ENRICHED_KINDS = frozenset({SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct})
+
+# Maximum number of source lines to scan when looking for the opening brace '{' of a
+# class/interface/struct declaration (handles multi-line declarations with long generic
+# parameter lists or where-constraints).
+_MAX_DECLARATION_LINES = 15
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -115,20 +140,252 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         def child_inclusion_predicate(s: LanguageServerSymbol) -> bool:
             return not s.is_low_level()
 
-        symbol_dicts = []
+        symbol_dicts: list[LanguageServerSymbol.OutputDict] = []
         for symbol in symbols:
-            symbol_dicts.append(
-                symbol.to_dict(
-                    name_path=False,
-                    name=True,
+            symbol_dicts.extend(
+                _flatten_transparent_containers_to_dicts(
+                    symbol,
                     depth=depth,
-                    kind=True,
-                    relative_path=False,
-                    location=False,
                     child_inclusion_predicate=child_inclusion_predicate,
+                    project=self.project,
                 )
             )
         return symbol_dicts
+
+
+def _extract_inheritance_from_source(symbol: LanguageServerSymbol, project: "Project") -> str | None:
+    """
+    Extracts the inheritance clause from the source declaration of a Class/Interface/Struct symbol.
+
+    Reads the source file starting at the symbol's declared line and uses a regex to locate the
+    inheritance part (e.g. ``: BaseClass, IInterface``). Multi-line declarations as well as
+    C#/Java-style generic type parameters and ``where`` constraints are handled.
+
+    Supported C# declaration forms (access modifiers, ``abstract``, ``sealed``, etc. are all
+    tolerated):
+
+    - ``public class MyClass : BaseClass, IFoo``
+    - ``public class MyClass<T> : Bar<T> where T : IComparable``
+    - ``public class MyClass : Bar<List<int>, Dictionary<string, int>>``
+    - ``public record class Foo : Bar``
+    - ``public record struct Foo : IFoo``
+
+    :param symbol: the symbol to inspect; must have ``relative_path`` and ``line`` set
+    :param project: the project instance used to read the source file
+    :return: the inheritance suffix string like ``: BaseClass, IInterface``, or None if the symbol
+        has no base types or the declaration could not be parsed
+    """
+    if symbol.relative_path is None or symbol.line is None:
+        return None
+    try:
+        lines = project.read_file(symbol.relative_path).splitlines()
+        start_line = symbol.line
+        if start_line >= len(lines):
+            return None
+
+        # collect up to _MAX_DECLARATION_LINES lines from the declaration line onwards until '{' is found
+        declaration_parts: list[str] = []
+        for i in range(start_line, min(start_line + _MAX_DECLARATION_LINES, len(lines))):
+            declaration_parts.append(lines[i])
+            if "{" in lines[i]:
+                break
+
+        # collapse the indentation of continuation lines, so that a declaration spanning several
+        # lines yields the same suffix as the equivalent single-line declaration
+        declaration = re.sub(r"\s+", " ", " ".join(declaration_parts))
+
+        # truncate at the opening brace (start of the body)
+        brace_idx = declaration.find("{")
+        if brace_idx != -1:
+            declaration = declaration[:brace_idx]
+
+        # remove 'where' constraint clauses (e.g. 'where T : IComparable')
+        declaration = re.sub(r"\bwhere\b.*$", "", declaration, flags=re.DOTALL).strip()
+
+        # Look for the inheritance clause after the type name (and optional generics):
+        # [^:]* greedily consumes everything that is not ':' (i.e. the optional generic type
+        # parameters), then the ':' introduces the base type list.
+        name_pattern = re.escape(symbol.name)
+        m = re.search(
+            rf"\b(?:class|interface|struct|record(?:\s+(?:class|struct))?)\s+{name_pattern}\b[^:]*:\s*(.+)",
+            declaration,
+        )
+        if m:
+            bases = m.group(1).strip().rstrip(",").strip()
+            if bases:
+                return ": " + bases
+    except Exception:
+        log.debug("Failed to extract inheritance from source for symbol %s", symbol.name, exc_info=True)
+    return None
+
+
+def _count_singleton_wrapper_depth(
+    children: list[LanguageServerSymbol],
+    child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
+) -> int:
+    """
+    Returns 1 if the given children list represents a singleton non-transparent wrapper (e.g. a lone
+    Class inside a Namespace in a typical C# file), 0 otherwise.
+
+    A singleton wrapper is a non-transparent symbol that is the *only* visible child at its level and
+    itself has visible descendants. In that case the symbol acts as a structural wrapper and should
+    not consume the user's depth budget.
+
+    Transparent containers are deliberately excluded here because they are already handled by the
+    recursion in :func:`_flatten_transparent_containers_to_dicts`. The compensation is capped at +1:
+    a Class is a meaningful symbol (unlike a Namespace), so we do not recurse further.
+    """
+    if len(children) != 1:
+        return 0
+
+    only_child = children[0]
+
+    # transparent containers are handled by the caller's recursion
+    if only_child.symbol_kind in _TRANSPARENT_CONTAINER_KINDS:
+        return 0
+
+    # check whether the sole non-transparent child itself has visible descendants
+    has_grandchildren = any(child_inclusion_predicate(c) for c in only_child.iter_children())
+    if not has_grandchildren:
+        return 0  # leaf symbol; no extra depth needed
+
+    # the single non-transparent child (e.g. a Class) acts as a wrapper -> +1
+    return 1
+
+
+def _enhance_symbol_dict(
+    symbol: LanguageServerSymbol,
+    output_dict: LanguageServerSymbol.OutputDict,
+    child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
+    parent_symbol: LanguageServerSymbol | None = None,
+    project: "Project | None" = None,
+) -> None:
+    """
+    Recursively enhances an OutputDict (as produced by ``to_dict``) in-place with:
+
+    1. **Signatures** - for callable symbols (Method, Function, Constructor) the LSP ``detail``
+       field (e.g. ``(int a, int b): int``) is appended to the ``name`` entry, so the LM sees full
+       signatures instead of bare names.
+    2. **Inheritance info** - for Class/Interface/Struct symbols the inheritance clause is extracted
+       from the source file and appended to the name as a ``: BaseClass, IInterface`` suffix.
+    3. **Constructor detection** - in C# (and similar OO languages) the language server returns
+       constructors as ``Method`` symbols whose name matches the enclosing class name. Such entries
+       are relabelled to ``kind="Constructor"``, so the LM can tell them apart from regular methods.
+    4. **Recursion** - the *symbol* tree is walked in parallel with the *dict* tree, so that each
+       enhancement is applied with access to the full symbol metadata (including the LSP ``detail``
+       field and the parent reference).
+
+    :param symbol: the symbol whose data was used to build ``output_dict``
+    :param output_dict: the dict produced by ``symbol.to_dict()``, modified in-place
+    :param child_inclusion_predicate: the predicate that was passed to ``to_dict``, such that the
+        child symbol list matches the ``children`` list in the dict
+    :param parent_symbol: the parent symbol, used for constructor detection (None for root symbols)
+    :param project: the project instance used to read source files for inheritance extraction
+        (Class/Interface/Struct symbols only); if None, no inheritance info is added
+    """
+    # 1. append the LSP detail (signature) to the name for callable kinds
+    if symbol.symbol_kind in _DETAIL_INCLUDED_KINDS:
+        detail: str = symbol.symbol_root.get("detail", "") or ""
+        if detail and "name" in output_dict:
+            output_dict["name"] = f"{symbol.name} {detail}"
+
+    # 2. append source-based inheritance info for Class/Interface/Struct
+    elif symbol.symbol_kind in _INHERITANCE_ENRICHED_KINDS and project is not None:
+        suffix = _extract_inheritance_from_source(symbol, project)
+        if suffix and "name" in output_dict:
+            output_dict["name"] = f"{symbol.name} {suffix}"
+
+    # 3. detect C# constructors (emitted as Method symbols with the enclosing class' name) and relabel them
+    if (
+        symbol.symbol_kind == SymbolKind.Method
+        and "kind" in output_dict
+        and parent_symbol is not None
+        and parent_symbol.symbol_kind == SymbolKind.Class
+        and parent_symbol.name == symbol.name
+    ):
+        output_dict["kind"] = "Constructor"
+
+    # 4. recurse into the children
+    if "children" not in output_dict:
+        return
+    child_dicts = output_dict["children"]
+    # The child dicts correspond 1-to-1 (in order) to the children that passed the inclusion
+    # predicate, because to_dict() builds them in iteration order.
+    child_symbols = [c for c in symbol.iter_children() if child_inclusion_predicate(c)]
+    for child_sym, child_dict in zip(child_symbols, child_dicts, strict=True):
+        _enhance_symbol_dict(child_sym, child_dict, child_inclusion_predicate, parent_symbol=symbol, project=project)
+
+
+def _flatten_transparent_containers_to_dicts(
+    symbol: LanguageServerSymbol,
+    depth: int,
+    child_inclusion_predicate: Callable[[LanguageServerSymbol], bool],
+    project: "Project | None" = None,
+) -> list[LanguageServerSymbol.OutputDict]:
+    """
+    Converts a symbol to one or more OutputDicts, automatically "seeing through" purely structural
+    containers (Namespace, Module, Package), such that the user always sees meaningful content even
+    at depth=0.
+
+    For transparent containers the strategy is:
+
+    - The container itself is emitted with an effective depth that compensates for all "wrapper"
+      levels between the container and the first level of real content, specifically
+
+      * ``+1`` for the transparent container itself (it is structural, not meaningful, and should
+        not consume the user's depth budget),
+      * ``+1`` (via :func:`_count_singleton_wrapper_depth`) if the transparent container's only
+        child is a *non-transparent* singleton wrapper (e.g. a lone Class in a C# namespace). That
+        class also acts purely as a structural wrapper in single-class files and should not consume
+        the user's depth budget either.
+
+    - If a transparent container has *exactly one* child which is also transparent, we recurse and
+      flatten further, so the user does not see a chain of nested namespaces.
+
+    For all other symbols the behaviour is the same as a plain ``to_dict`` call.
+    """
+    if symbol.symbol_kind not in _TRANSPARENT_CONTAINER_KINDS:
+        # regular symbol; emit it as-is and apply the enhancements
+        output_dict = symbol.to_dict(
+            name_path=False,
+            name=True,
+            depth=depth,
+            kind=True,
+            relative_path=False,
+            location=False,
+            child_inclusion_predicate=child_inclusion_predicate,
+        )
+        _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate, project=project)
+        return [output_dict]
+
+    children = [c for c in symbol.iter_children() if child_inclusion_predicate(c)]
+
+    # If the container has exactly one child which is *also* a transparent container, skip the outer
+    # wrapper entirely and recurse on the inner one. This collapses chains like
+    # Namespace(A) -> Namespace(A.B) -> Class(Foo) into a single entry "Namespace A.B -> {Class Foo}".
+    if len(children) == 1 and children[0].symbol_kind in _TRANSPARENT_CONTAINER_KINDS:
+        return _flatten_transparent_containers_to_dicts(
+            children[0],
+            depth=depth,
+            child_inclusion_predicate=child_inclusion_predicate,
+            project=project,
+        )
+
+    # The container has substantive children; emit it with depth + 1 + extra_depth, such that neither
+    # the transparent container nor a singleton non-transparent wrapper (e.g. a lone class in a C#
+    # file) consumes the user's depth budget.
+    extra_depth = _count_singleton_wrapper_depth(children, child_inclusion_predicate)
+    output_dict = symbol.to_dict(
+        name_path=False,
+        name=True,
+        depth=depth + 1 + extra_depth,
+        kind=True,
+        relative_path=False,
+        location=False,
+        child_inclusion_predicate=child_inclusion_predicate,
+    )
+    _enhance_symbol_dict(symbol, output_dict, child_inclusion_predicate, project=project)
+    return [output_dict]
 
 
 class FindSymbolTool(Tool, ToolMarkerSymbolicRead):

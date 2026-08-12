@@ -19,7 +19,7 @@ class _StubSymbol:
 def _retriever_with_find_result(result: list) -> LanguageServerSymbolRetriever:
     """Build a retriever without running __init__ and stub its `find` to a fixed result."""
     retriever = LanguageServerSymbolRetriever.__new__(LanguageServerSymbolRetriever)
-    retriever.find = lambda *args, **kwargs: result  # type: ignore[method-assign]
+    retriever.find = lambda *args, **kwargs: result
     return retriever
 
 
