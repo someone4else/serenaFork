@@ -170,6 +170,11 @@ def _extract_inheritance_from_source(symbol: LanguageServerSymbol, project: "Pro
     - ``public record class Foo : Bar``
     - ``public record struct Foo : IFoo``
 
+    Only brace-delimited declarations are considered, i.e. the declaration must be followed by an
+    opening ``{`` within the scanned lines. This restricts the extraction to languages where a
+    colon introduces the base type list (C#, C++, ...). In Python the very same colon opens the
+    class body instead, so its declarations are deliberately left alone.
+
     :param symbol: the symbol to inspect; must have ``relative_path`` and ``line`` set
     :param project: the project instance used to read the source file
     :return: the inheritance suffix string like ``: BaseClass, IInterface``, or None if the symbol
@@ -189,15 +194,16 @@ def _extract_inheritance_from_source(symbol: LanguageServerSymbol, project: "Pro
             declaration_parts.append(lines[i])
             if "{" in lines[i]:
                 break
+        else:
+            # no opening brace in sight: not a brace-language declaration (see the docstring)
+            return None
 
         # collapse the indentation of continuation lines, so that a declaration spanning several
         # lines yields the same suffix as the equivalent single-line declaration
         declaration = re.sub(r"\s+", " ", " ".join(declaration_parts))
 
         # truncate at the opening brace (start of the body)
-        brace_idx = declaration.find("{")
-        if brace_idx != -1:
-            declaration = declaration[:brace_idx]
+        declaration = declaration[: declaration.find("{")]
 
         # remove 'where' constraint clauses (e.g. 'where T : IComparable')
         declaration = re.sub(r"\bwhere\b.*$", "", declaration, flags=re.DOTALL).strip()

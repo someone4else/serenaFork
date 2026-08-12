@@ -9,6 +9,7 @@ from typing import Any
 
 from serena.symbol import LanguageServerSymbol
 from serena.tools.symbol_tools import (
+    _MAX_DECLARATION_LINES,
     _count_singleton_wrapper_depth,
     _extract_inheritance_from_source,
     _flatten_transparent_containers_to_dicts,
@@ -86,6 +87,22 @@ class TestExtractInheritanceFromSource:
     def test_multi_line_declaration(self):
         source = "public sealed class Foo\n    : Bar,\n      IBaz\n{\n}\n"
         assert self._extract(source, "Foo") == ": Bar, IBaz"
+
+    def test_brace_on_the_same_line(self):
+        assert self._extract("public class Foo : Bar {\n}\n", "Foo") == ": Bar"
+
+    def test_cpp_access_specifier_is_kept(self):
+        assert self._extract("class Foo : public Bar {\n};\n", "Foo") == ": public Bar"
+
+    def test_python_declarations_are_left_alone(self):
+        # In Python the colon opens the class body rather than a base type list, so extracting from
+        # it would splice the body into the symbol name. Such declarations have no brace and are
+        # therefore skipped.
+        assert self._extract('class Foo(Bar):\n    """Doc: something."""\n    x = 1\n', "Foo") is None
+        assert self._extract('class Foo:\n    """Doc."""\n    x = 1\n', "Foo") is None
+
+    def test_declaration_without_a_brace_is_skipped(self):
+        assert self._extract("public class Foo : Bar\n" + "\n" * _MAX_DECLARATION_LINES, "Foo") is None
 
     def test_declaration_of_a_different_symbol_is_not_matched(self):
         # The regex is anchored on the symbol's own name, so a neighbouring declaration is ignored.
