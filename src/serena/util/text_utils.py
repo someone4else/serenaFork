@@ -322,6 +322,11 @@ def search_files(
         """Process a single file - this function will be parallelized."""
         relative_path = file_proxy.get_relative_path()
         try:
+            # skip files that are pointless (and expensive) to search before reading them into memory:
+            # a text search can never match inside a binary file, and very large files are almost
+            # never source code
+            if not file_proxy.is_searchable():
+                return {"path": relative_path, "results": [], "error": None}
             file_content = file_proxy.get_contents()
             search_results = search_text(
                 pattern,

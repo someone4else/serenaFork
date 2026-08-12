@@ -27,6 +27,15 @@ class FileProxy(ABC):
         :return: whether the proxy supports glob filtering based on its relative path
         """
 
+    def is_searchable(self) -> bool:
+        """
+        :return: whether it is worth searching this file's contents. Proxies that can cheaply
+            establish that a file cannot usefully be searched (binary content, excessive size)
+            return False, so that bulk consumers such as the project-wide text search can skip
+            it instead of reading it into memory. The default implementation returns True.
+        """
+        return True
+
     @staticmethod
     def is_external_path(relative_path: str) -> bool:
         """
@@ -44,19 +53,48 @@ class FileProxy(ABC):
 
 
 class LocalProjectFileProxy(FileProxy):
+    MAX_SEARCHABLE_FILE_SIZE = 20 * 1024 * 1024
+    """
+    Upper bound on the size of a file that will be read in order to search it. Files larger than
+    this are almost never source code we want to grep (data dumps, bundled/minified assets, ...),
+    and loading them would waste memory and CPU. The limit is deliberately generous.
+    """
+
     def __init__(self, relative_path: str, project: "Project"):
         self._relative_path = relative_path
         self._project = project
 
+    def _get_abs_path(self) -> str:
+        return os.path.join(self._project.project_root, self._relative_path)
+
     def get_contents(self) -> str:
-        abs_path = os.path.join(self._project.project_root, self._relative_path)
-        with open(abs_path, encoding=self._project.project_config.encoding) as f:
+        with open(self._get_abs_path(), encoding=self._project.project_config.encoding) as f:
             return f.read()
 
     def get_relative_path(self) -> str:
         return self._relative_path
 
     def is_glob_supported(self):
+        return True
+
+    def is_searchable(self) -> bool:
+        # local import to avoid a circular import (solidlsp imports back into serena.util)
+        from solidlsp.ls_utils import FileUtils
+
+        # Both checks are cheap (a stat and a small header sniff), so they pay for themselves by
+        # avoiding a full read of e.g. a compiled assembly or a multi-megabyte data blob.
+        abs_path = self._get_abs_path()
+        try:
+            if os.path.getsize(abs_path) > self.MAX_SEARCHABLE_FILE_SIZE:
+                log.debug(f"Skipping {self._relative_path}: exceeds the maximum searchable file size")
+                return False
+        except OSError:
+            # The size could not be determined (e.g. the path does not exist); fall through and let
+            # the file reader surface the error, preserving the previous behavior.
+            return True
+        if FileUtils.is_binary_file(abs_path):
+            log.debug(f"Skipping {self._relative_path}: binary file")
+            return False
         return True
 
 

@@ -1,8 +1,9 @@
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
-from serena.util.file_proxy import FileCollection, FileProxy
+from serena.util.file_proxy import FileCollection, FileProxy, LocalProjectFileProxy
 from serena.util.text_utils import GlobMatcher, LineType, MultiFileContentReplacer, search_files, search_text
 
 
@@ -656,3 +657,65 @@ class TestMultiFileContentReplacer:
         occ = replacer.find_occurrences([(path, content)], "old_pkg", "new_pkg")[0]
         with pytest.raises(AssertionError):
             replacer.apply_to_content("completely different content", [occ])
+
+
+class TestSearchFilesResourceSkips:
+    """search_files must not spend resources on files that are useless to search (binary or huge):
+    such files must be skipped without ever being read into memory.
+    """
+
+    def test_unsearchable_files_are_not_read(self):
+        read_paths: list[str] = []
+
+        class RecordingFileProxy(MockFileProxy):
+            def __init__(self, relative_path: str, searchable: bool):
+                super().__init__(relative_path)
+                self._searchable = searchable
+
+            def is_searchable(self) -> bool:
+                return self._searchable
+
+            def get_contents(self) -> str:
+                read_paths.append(self.relative_path)
+                return super().get_contents()
+
+        collection = FileCollection(
+            [
+                RecordingFileProxy("a.py", searchable=True),
+                RecordingFileProxy("lib.dll", searchable=False),
+                RecordingFileProxy("huge.log", searchable=False),
+            ]
+        )
+        matches = search_files(collection, "match")
+
+        assert sorted({m.source_file_path for m in matches}) == ["a.py"]
+        # The useless files were skipped before reading; only the source file was actually read.
+        assert read_paths == ["a.py"]
+
+
+class TestLocalProjectFileProxyIsSearchable:
+    """LocalProjectFileProxy decides searchability from a stat and a small header sniff."""
+
+    @staticmethod
+    def _proxy(tmp_path, relative_path: str) -> LocalProjectFileProxy:
+        project = SimpleNamespace(project_root=str(tmp_path), project_config=SimpleNamespace(encoding="utf-8"))
+        return LocalProjectFileProxy(relative_path, project)  # type: ignore[arg-type]
+
+    def test_source_file_is_searchable(self, tmp_path):
+        (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        assert self._proxy(tmp_path, "a.py").is_searchable()
+
+    def test_binary_file_is_not_searchable(self, tmp_path):
+        # The binary even contains the search token as raw bytes: it must still be skipped.
+        (tmp_path / "lib.dll").write_bytes(b"MZ\x90\x00" + bytes(range(256)) + b"MATCHME")
+        assert not self._proxy(tmp_path, "lib.dll").is_searchable()
+
+    def test_oversized_file_is_not_searchable(self, tmp_path, monkeypatch):
+        # Cap the searchable size at a tiny value so the test does not need a huge file.
+        monkeypatch.setattr(LocalProjectFileProxy, "MAX_SEARCHABLE_FILE_SIZE", 64)
+        (tmp_path / "huge.log").write_text("MATCHME " * 100, encoding="utf-8")
+        assert not self._proxy(tmp_path, "huge.log").is_searchable()
+
+    def test_missing_file_falls_through_to_the_reader(self, tmp_path):
+        # A non-existent path must not be skipped by the size pre-check; the reader still decides.
+        assert self._proxy(tmp_path, "does_not_exist.py").is_searchable()
