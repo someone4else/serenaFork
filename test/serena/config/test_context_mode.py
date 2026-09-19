@@ -36,7 +36,7 @@ def test_grok_context_loads():
 
     assert context.name == "grok"
     assert context.single_project is True
-    assert context.structured_tool_output is None
+    assert context.structured_tool_output is False
     assert set(context.excluded_tools) == GROK_EXCLUDED_TOOLS
 
 
@@ -47,6 +47,18 @@ def test_grok_context_prompt_renders():
 
     assert rendered_prompt.strip()
     assert "Serena's code intelligence tools" in rendered_prompt
+
+
+@pytest.mark.parametrize("context_name", BUILTIN_RUNTIME_CONTEXT_NAMES)
+def test_builtin_contexts_disable_structured_tool_output(context_name: str):
+    """Structured output must stay off for every context, whether the context YAML declares it or not.
+
+    Every tool returns a plain string, so the MCP SDK would repeat the whole text in `structuredContent`
+    as `{"result": <text>}` and a client that does not unpack the wrapper would receive it twice.
+    """
+    context = SerenaAgentContext.from_name(context_name)
+
+    assert context.structured_tool_output is False
 
 
 @pytest.mark.parametrize("context_name", BUILTIN_RUNTIME_CONTEXT_NAMES)

@@ -81,6 +81,22 @@ def test_make_tool_execution() -> None:
     assert result == "Hello Alice, you are 30 years old!"
 
 
+def test_make_tool_structured_output_disabled_by_context() -> None:
+    """Test that a context serving no structured output keeps the output schema off the MCP tool.
+
+    A string-returning tool would otherwise have the MCP SDK repeat its entire text in
+    `structuredContent` as `{"result": <text>}`, which clients that do not unpack the wrapper receive
+    in addition to the plain text.
+    """
+    mock_tool = BasicTool()
+    context = SerenaAgentContext.load_default()
+
+    mcp_tool = make_tool(mock_tool, structured_output=context.structured_tool_output)
+
+    assert context.structured_tool_output is False
+    assert mcp_tool.output_schema is None
+
+
 def test_make_tool_no_params() -> None:
     """Test make_tool with a function that has no parameters."""
 

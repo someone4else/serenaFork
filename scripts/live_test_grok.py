@@ -960,47 +960,40 @@ class GrokLiveTest:
 
     def _check_m5_structured_output(self) -> None:
         """
-        Verifies the structured-tool-output wire shape of the grok context (auto default) against the
-        claude-code context (explicit ``false`` workaround): for a string-returning tool, the grok
-        context must advertise an output schema and return ``structuredContent`` while claude-code
-        must serve plain text only.
+        Verifies the structured-tool-output wire shape of the grok and claude-code contexts: structured
+        output is disabled by default, so for a string-returning tool neither context may advertise an
+        output schema or return ``structuredContent``, which would merely repeat the text as
+        ``{"result": <text>}``.
 
         This pins what Serena *serves* under each context; whether Grok Build unpacks
         ``structuredContent`` client-side can only be observed in a real agent session, which is
         out of scope for a zero-inference test.
         """
-        self._section("M5 — structured tool output over the wire (grok auto default vs claude-code workaround)")
+        self._section("M5 — structured tool output over the wire (disabled in every context)")
         grok_probe = self._probe_tool_call("M5", "grok")
         if grok_probe is None:
             return
         claude_probe = self._probe_tool_call("M5", "claude-code")
         if claude_probe is None:
             return
-        grok_schema, grok_result = grok_probe
-        claude_schema, claude_result = claude_probe
+        probes = {"grok": grok_probe, "claude-code": claude_probe}
 
         problems = []
-        grok_structured = grok_result.get("structuredContent")
-        if grok_result.get("isError"):
-            problems.append("grok: probe tool call returned isError")
-        if not isinstance(grok_schema, dict):
-            problems.append("grok: no outputSchema advertised for the string-returning probe tool")
-        if not (isinstance(grok_structured, dict) and isinstance(grok_structured.get("result"), str)):
-            problems.append("grok: structuredContent missing or not of shape {'result': str}")
-        if claude_result.get("isError"):
-            problems.append("claude-code: probe tool call returned isError")
-        if claude_schema is not None:
-            problems.append("claude-code: unexpectedly advertises an outputSchema despite structured_tool_output=false")
-        if claude_result.get("structuredContent") is not None:
-            problems.append("claude-code: unexpectedly returns structuredContent despite structured_tool_output=false")
+        for context, (schema, result) in probes.items():
+            if result.get("isError"):
+                problems.append(f"{context}: probe tool call returned isError")
+            if schema is not None:
+                problems.append(f"{context}: advertises an outputSchema despite structured_tool_output=false")
+            if result.get("structuredContent") is not None:
+                problems.append(f"{context}: returns structuredContent despite structured_tool_output=false")
 
         self._write_evidence(
             "M5.txt",
             f"probe tool: {STRUCTURED_OUTPUT_PROBE_TOOL}\n"
-            f"grok outputSchema: {json.dumps(grok_schema)}\n"
-            f"grok structuredContent keys: {sorted(grok_structured) if isinstance(grok_structured, dict) else grok_structured!r}\n"
-            f"claude-code outputSchema: {json.dumps(claude_schema)}\n"
-            f"claude-code structuredContent: {claude_result.get('structuredContent')!r}\n",
+            + "".join(
+                f"{context} outputSchema: {json.dumps(schema)}\n{context} structuredContent: {result.get('structuredContent')!r}\n"
+                for context, (schema, result) in probes.items()
+            ),
         )
         if problems:
             self._record("M5", Status.FAIL, "; ".join(problems))
@@ -1008,8 +1001,7 @@ class GrokLiveTest:
             self._record(
                 "M5",
                 Status.PASS,
-                "grok serves outputSchema + structuredContent({'result': str}); claude-code serves plain text only "
-                "(auto-default divergence verified on the wire)",
+                "grok and claude-code both serve plain text only, without outputSchema or structuredContent",
             )
 
     # ------------------------------------------------------------------ phase D: hook discovery

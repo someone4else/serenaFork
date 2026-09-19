@@ -34,5 +34,7 @@ tool_description_overrides: {}
 # The `activate_project` tool will, therefore, be disabled in this case, as project switching is not allowed.
 single_project: false
 
-# whether to make MCP tools return structured output (null = auto-detect, true = always, false = never)
-structured_tool_output: null
+# whether to make MCP tools return structured output (null = auto-detect, true = always, false = never).
+# Auto-detection wraps the string returned by every tool in {"result": <text>}, so a client that does not
+# unpack the wrapper receives each response twice; structured output is therefore disabled by default.
+structured_tool_output: false

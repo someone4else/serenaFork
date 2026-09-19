@@ -184,9 +184,12 @@ class SerenaAgentContext(ToolInclusionDefinition, ToStringMixin):
     The `activate_project` tool will, therefore, be disabled in this case, as project switching is not allowed.
     """
 
-    structured_tool_output: bool | None = None
+    structured_tool_output: bool | None = False
     """
-    whether to use structured output for tools (None = auto)
+    whether to use structured output for tools (None = auto).
+    The default deviates from upstream: every tool returns a plain string, for which the MCP SDK builds a
+    wrapper schema and repeats the entire text in `structuredContent` as `{"result": <text>}`, so a client
+    that does not unpack it receives each response twice.
     """
 
     def _tostring_includes(self) -> list[str]:
