@@ -58,7 +58,7 @@ from solidlsp.lsp_protocol_handler.server import (
     StringDict,
 )
 from solidlsp.settings import SolidLSPSettings
-from solidlsp.util.cache import load_cache, save_cache
+from solidlsp.util.cache import CacheFileBusyError, CacheSaveSchedule, load_cache, save_cache
 from solidlsp.util.pickle_util import SafePickleLoader
 
 RawDocumentSymbol = Union[DocumentSymbol, SymbolInformation]
@@ -372,6 +372,14 @@ class SolidLanguageServer(ABC):
     """
     DOCUMENT_SYMBOL_CACHE_FILENAME = "document_symbols.pkl"
 
+    CACHE_SAVE_REPLACE_TIMEOUT = 0.5
+    """
+    the time in seconds for which a regular save waits for a cache file held open by another process (per cache file;
+    regular saves happen after tool calls, so the wait delays the tool's response)
+    """
+    FINAL_CACHE_SAVE_REPLACE_TIMEOUT = 30.0
+    """the time in seconds for which the save before stopping the language server waits for a busy cache file"""
+
     # Directories that should always be ignored regardless of language:
     # VCS internals, virtual environments, caches, and serena's own data.
     _ALWAYS_IGNORED_DIRS = frozenset(
@@ -560,6 +568,7 @@ class SolidLanguageServer(ABC):
         self._raw_document_symbols_cache: dict[str, tuple[str, list[DocumentSymbol] | list[SymbolInformation] | None]] = {}
         """maps relative file paths to a tuple of (file_content_hash, raw_root_symbols)"""
         self._raw_document_symbols_cache_is_modified: bool = False
+        self._cache_save_schedule = CacheSaveSchedule()
         self._load_raw_document_symbols_cache()
         # * high-level document symbols cache
         self._document_symbols_cache: dict[str, tuple[str, DocumentSymbols]] = {}
@@ -3105,7 +3114,7 @@ class SolidLanguageServer(ABC):
         version.append(self._raw_document_symbols_cache_version())
         return tuple(version)
 
-    def _save_raw_document_symbols_cache(self) -> None:
+    def _save_raw_document_symbols_cache(self, replace_timeout: float) -> None:
         cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME
 
         if not self._raw_document_symbols_cache_is_modified:
@@ -3114,14 +3123,18 @@ class SolidLanguageServer(ABC):
 
         log.info("Saving updated raw document symbols cache to %s", cache_file)
         try:
-            save_cache(str(cache_file), self._raw_document_symbols_cache_version(), self._raw_document_symbols_cache)
-            self._raw_document_symbols_cache_is_modified = False
-        except Exception as e:
-            log.error(
-                "Failed to save raw document symbols cache to %s: %s. Note: this may have resulted in a corrupted cache file.",
-                cache_file,
-                e,
+            save_cache(
+                str(cache_file),
+                self._raw_document_symbols_cache_version(),
+                self._raw_document_symbols_cache,
+                replace_timeout=replace_timeout,
             )
+            self._raw_document_symbols_cache_is_modified = False
+        except CacheFileBusyError as e:
+            log.warning("%s; the raw document symbols cache will be saved later", e)
+            self._cache_save_schedule.pause()
+        except Exception as e:
+            log.error("Failed to save raw document symbols cache to %s: %s", cache_file, e)
 
     def _raw_document_symbols_cache_fingerprint(self) -> Hashable | None:
         """
@@ -3170,7 +3183,7 @@ class SolidLanguageServer(ABC):
                     e,
                 )
 
-    def _save_document_symbols_cache(self) -> None:
+    def _save_document_symbols_cache(self, replace_timeout: float) -> None:
         cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME
 
         if not self._document_symbols_cache_is_modified:
@@ -3179,14 +3192,15 @@ class SolidLanguageServer(ABC):
 
         log.info("Saving updated document symbols cache to %s", cache_file)
         try:
-            save_cache(str(cache_file), self._document_symbols_cache_version(), self._document_symbols_cache)
-            self._document_symbols_cache_is_modified = False
-        except Exception as e:
-            log.error(
-                "Failed to save document symbols cache to %s: %s. Note: this may have resulted in a corrupted cache file.",
-                cache_file,
-                e,
+            save_cache(
+                str(cache_file), self._document_symbols_cache_version(), self._document_symbols_cache, replace_timeout=replace_timeout
             )
+            self._document_symbols_cache_is_modified = False
+        except CacheFileBusyError as e:
+            log.warning("%s; the document symbols cache will be saved later", e)
+            self._cache_save_schedule.pause()
+        except Exception as e:
+            log.error("Failed to save document symbols cache to %s: %s", cache_file, e)
 
     def _load_document_symbols_cache(self) -> None:
         cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME
@@ -3205,9 +3219,20 @@ class SolidLanguageServer(ABC):
                     e,
                 )
 
-    def save_cache(self) -> None:
-        self._save_raw_document_symbols_cache()
-        self._save_document_symbols_cache()
+    def save_cache(self, final: bool = False) -> None:
+        """
+        Saves the modified symbol caches.
+
+        :param final: whether this is the last save before the language server stops; it is then attempted even while
+            regular saves are paused (after a cache file was found in use by another process) and waits longer for a
+            busy cache file
+        """
+        if not final and not self._cache_save_schedule.is_due():
+            log.debug("Saving the symbol caches is paused, as a cache file was in use by another process")
+            return
+        replace_timeout = self.FINAL_CACHE_SAVE_REPLACE_TIMEOUT if final else self.CACHE_SAVE_REPLACE_TIMEOUT
+        self._save_raw_document_symbols_cache(replace_timeout)
+        self._save_document_symbols_cache(replace_timeout)
 
     def request_workspace_symbol(self, query: str) -> list[ls_types.UnifiedSymbolInformation] | None:
         """

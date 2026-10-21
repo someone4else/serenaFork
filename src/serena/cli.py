@@ -1022,7 +1022,7 @@ class ProjectCommands(AutoRegisteringGroup):
                 click.echo(f"Symbols in file '{file}':")
                 for symbol in symbols:
                     click.echo(f"  - {symbol['name']} at line {symbol['selectionRange']['start']['line']} of kind {symbol['kind']}")
-            ls.save_cache()
+            ls.save_cache(final=True)
             click.echo(f"Successfully indexed file '{file}', {len(symbols)} symbols saved to cache in {ls.cache_dir}.")
         finally:
             ls_mgr.stop_all()

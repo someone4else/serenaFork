@@ -244,7 +244,7 @@ class LanguageServerManager:
     def _stop_language_server(ls: SolidLanguageServer, save_cache: bool = False, timeout: float = 2.0) -> None:
         if ls.is_running():
             if save_cache:
-                ls.save_cache()
+                ls.save_cache(final=True)
             log.info(f"Stopping language server for language {ls.ls_id} ...")
             ls.stop(shutdown_timeout=timeout)
 
