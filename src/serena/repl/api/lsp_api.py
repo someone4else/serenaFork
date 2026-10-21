@@ -436,7 +436,11 @@ class LspApi(FacadeApi):
             location=False,
             child_inclusion_predicate=_is_not_low_level,
         )
-        renderer = LspSymbolsOverviewRenderer(self._agent, max_answer_chars, output_params, grouper=self.overview_grouper_)
+        # enriched overview of the Serena fork (imported lazily, as the module builds upon this one)
+        from serena.symbol_overview_enrichment import EnrichedSymbolsOverviewRenderer, SymbolOverviewEnricher
+
+        enricher = SymbolOverviewEnricher.for_file(symbols, self._get_project().read_file(relative_path), relative_path)
+        renderer = EnrichedSymbolsOverviewRenderer(self._agent, max_answer_chars, output_params, enricher, grouper=self.overview_grouper_)
         return LspSymbolCollection(symbols, renderer)
 
     @facade_method(uses_project_server=True, corresponding_tool=FindSymbolTool)
