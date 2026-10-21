@@ -5,6 +5,8 @@ graceful shutdown), exercised through the HTTP routes of a server whose agent is
 import json
 import os
 import pickle
+import signal
+import socket
 import threading
 import time
 from pathlib import Path
@@ -30,8 +32,11 @@ SECRET = "test-shared-secret"
 AUTH = {"Authorization": f"Bearer {SECRET}"}
 
 
-def _make_server(registry_dir: Path, allowed_tools: tuple[str, ...] = ()) -> ExtendedProjectServer:
-    """Creates a server with a mocked agent (no language servers), as the upstream project server tests do."""
+def _make_server(registry_dir: Path, allowed_tools: tuple[str, ...] = (), mock_handlers: bool = True) -> ExtendedProjectServer:
+    """
+    Creates a server with a mocked agent (no language servers), as the upstream project server tests do; unless
+    `mock_handlers` is False, the upstream query and facade call handlers are replaced by stubs echoing the request.
+    """
     server = ExtendedProjectServer.__new__(ExtendedProjectServer)
     server._agent = MagicMock()
     server._agent.serena_config.auth_secret = SECRET
@@ -47,10 +52,22 @@ def _make_server(registry_dir: Path, allowed_tools: tuple[str, ...] = ()) -> Ext
     server._registry = ProjectServerRegistryFile(server._port, os.getpid(), directory=str(registry_dir))
     server._readiness = ProjectReadinessTracker(on_change=server._registry.write)
     server._warmer = ProjectWarmer(server._get_project, server._readiness)
+    server._shutdown_scheduled = threading.Event()
     server._setup_routes()
-    server._query_project = lambda req: f"queried {req.tool_name}"
-    server._call_facade_method = lambda req: f"called {req.method_name}"
+    if mock_handlers:
+        server._query_project = lambda req: f"queried {req.tool_name}"
+        server._call_facade_method = lambda req: f"called {req.method_name}"
     return server
+
+
+def _register(server: ExtendedProjectServer, *project_roots: str) -> None:
+    """Registers projects (named after their root's last component) with the server's mocked configuration."""
+    registered = {
+        key: SimpleNamespace(project_root=Path(root), project_config=SimpleNamespace(project_name=Path(root).name))
+        for root in project_roots
+        for key in (root, Path(root).name)
+    }
+    _mocked_agent(server).serena_config.get_registered_project.side_effect = lambda key: registered.get(key)
 
 
 def _mocked_agent(server: ExtendedProjectServer) -> MagicMock:
@@ -128,6 +145,15 @@ class TestToolAllowlist:
         assert response.status_code == 400
         assert "project_name" in response.get_data(as_text=True)
 
+    def test_facade_call_for_an_unknown_facade_is_rejected_with_its_reason(self, tmp_path: Path) -> None:
+        server = _make_server(tmp_path, self.ALLOWED)
+        _mocked_agent(server).get_repl().entrypoint.get_facade_.side_effect = ValueError("No facade 'nope'")
+        body = {"project_name": "p", "facade_name": "nope", "method_name": "x", "args": [], "kwargs": {}}
+        with server._app.test_client() as client:
+            response = client.post("/call_facade_method", json=body, headers=AUTH)
+        assert response.status_code == 400
+        assert "No facade 'nope'" in response.get_data(as_text=True)
+
     def test_requests_still_require_authentication(self, tmp_path: Path) -> None:
         with _make_server(tmp_path, self.ALLOWED)._app.test_client() as client:
             assert client.post("/query_project", json={}).status_code == 401
@@ -186,22 +212,32 @@ class TestWarmUp:
         tracker.finish("/repo", error="boom")
         assert tracker.begin("/repo", "repo")
 
-    def test_warm_up_in_progress_does_not_hold_the_query_lock(self, tmp_path: Path) -> None:
-        # a cold project must not delay queries for other projects, which run under the server's process-wide lock
-        server = _make_server(tmp_path)
+    def test_hanging_probe_of_a_cold_project_does_not_delay_queries_for_another_project(self, tmp_path: Path) -> None:
+        # queries run under the server's process-wide lock (upstream _query_project); the probe must not take it
+        server = _make_server(tmp_path, mock_handlers=False)
+        _register(server, "/ready", "/cold")
+        server._loaded_projects_by_root[str(Path("/ready"))] = MagicMock()
+        _mocked_agent(server).get_tool_by_name.return_value.apply_ex.return_value = "found"
+
         release = threading.Event()
 
-        def load_slowly(root: str) -> Any:
-            release.wait(timeout=5)
-            return _stub_project(_StubLanguageServer(), [])
+        class _HangingLanguageServer(_StubLanguageServer):
+            def request_hover(self, relative_path: str, line: int, column: int) -> None:
+                release.wait(timeout=10)
 
-        server._warmer = ProjectWarmer(load_slowly, server._readiness)
-        server._warmer.start("/cold", "cold")
+        cold_project = _stub_project(_HangingLanguageServer(), ["A.cs"])
+        server._loaded_projects_by_root[str(Path("/cold"))] = cold_project
+        server.warm_up("/cold")
         try:
-            assert server._readiness.snapshot()["/cold"]["state"] == "loading"
-            assert server._active_project_lock.acquire(timeout=1)
-            server._active_project_lock.release()
-            assert _query(server, "find_symbol").status_code == 200
+            assert server._readiness.snapshot()[str(Path("/cold"))]["state"] == "loading"
+            start = time.monotonic()
+            with server._app.test_client() as client:
+                response = client.post(
+                    "/query_project", json={"project_name": "ready", "tool_name": "find_symbol", "tool_params_json": "{}"}, headers=AUTH
+                )
+            assert response.get_data(as_text=True) == "found"
+            assert time.monotonic() - start < 2
+            assert server._readiness.snapshot()[str(Path("/cold"))]["state"] == "loading"
         finally:
             release.set()
 
@@ -271,10 +307,70 @@ class TestShutdown:
         project.shutdown.assert_called_once()
         assert not os.path.exists(server._registry.path)
 
-    def test_shutdown_route_schedules_the_shutdown(self, tmp_path: Path) -> None:
+    def test_failing_server_loop_and_project_still_shut_down_the_others(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         server = _make_server(tmp_path)
-        scheduled: list[bool] = []
-        server._schedule_shutdown = lambda: scheduled.append(True)  # type: ignore[method-assign]
+        failing, healthy = MagicMock(), MagicMock()
+        failing.shutdown.side_effect = RuntimeError("cannot stop")
+        server._loaded_projects_by_root.update({"/failing": failing, "/healthy": healthy})
+        handlers: list[Any] = []
+
+        def fail(self: ProjectServer) -> None:
+            raise RuntimeError("server loop failed")
+
+        monkeypatch.setattr(ProjectServer, "run", fail)
+        monkeypatch.setattr("serena.project_server_ext.signal.signal", lambda signal_number, handler: handlers.append(handler))
+
+        with pytest.raises(RuntimeError, match="server loop failed"):
+            server.run()
+
+        healthy.shutdown.assert_called_once()
+        assert not os.path.exists(server._registry.path)
+        # termination signals are ignored during the clean-up
+        assert handlers[-1] is signal.SIG_IGN
+
+    def test_server_on_a_busy_port_leaves_the_other_servers_registry_alone(self, tmp_path: Path) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as other_server:
+            other_server.bind(("127.0.0.1", 0))
+            other_server.listen()
+            server = _make_server(tmp_path)
+            server._port = other_server.getsockname()[1]
+            server._registry = ProjectServerRegistryFile(server._port, os.getpid() + 1, directory=str(tmp_path))
+            server._registry.write({})
+            registry_content = Path(server._registry.path).read_text(encoding="utf-8")
+            server._registry = ProjectServerRegistryFile(server._port, os.getpid(), directory=str(tmp_path))
+
+            with pytest.raises(OSError, match="already in use"):
+                server.run()
+
+        assert Path(server._registry.path).read_text(encoding="utf-8") == registry_content
+
+    def test_shutdown_stops_a_project_whose_warm_up_was_still_loading(self, tmp_path: Path) -> None:
+        server = _make_server(tmp_path)
+        project = MagicMock()
+
+        def load_slowly(root: str) -> Any:
+            time.sleep(0.3)
+            server._loaded_projects_by_root[root] = project
+            return _stub_project(_StubLanguageServer(), [])
+
+        server._warmer = ProjectWarmer(load_slowly, server._readiness)
+        server._warmer.start("/slow", "slow")
+        server._shut_down_projects()
+        project.shutdown.assert_called_once()
+
+    def test_shutdown_route_schedules_the_shutdown_once(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _make_server(tmp_path)
+        timers: list[Any] = []
+
+        class _RecordingTimer:
+            def __init__(self, interval: float, function: Any) -> None:
+                timers.append(function)
+
+            def start(self) -> None:
+                pass
+
+        monkeypatch.setattr("serena.project_server_ext.threading.Timer", _RecordingTimer)
         with server._app.test_client() as client:
             assert client.post("/shutdown", headers=AUTH).status_code == 202
-        assert scheduled == [True]
+            assert client.post("/shutdown", headers=AUTH).status_code == 202
+        assert len(timers) == 1

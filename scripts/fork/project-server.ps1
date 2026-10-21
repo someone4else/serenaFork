@@ -34,7 +34,7 @@ param(
     [string]$TaskName = 'SerenaProjectServer',
     [int]$StartTimeoutSeconds = 120,
     # time granted to a graceful shutdown (saving large symbol caches can take a while) before the process is killed
-    [int]$ShutdownTimeoutSeconds = 120
+    [int]$ShutdownTimeoutSeconds = 180
 )
 
 $ErrorActionPreference = 'Stop'

@@ -10,14 +10,17 @@ import json
 import logging
 import os
 import signal
+import socket
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from flask import Response, request
+from pydantic import ValidationError
 from werkzeug.exceptions import HTTPException
 
 from serena import serena_version
@@ -88,6 +91,28 @@ class ProjectState(str, Enum):
     FAILED = "failed"
 
 
+@dataclass
+class ProjectReadiness:
+    """
+    The readiness of a project that is warmed up by the project server.
+    """
+
+    name: str
+    state: ProjectState
+    started_at: float
+    """the monotonic time at which the warm-up started"""
+    seconds: float | None = None
+    """the duration of the warm-up, once it is finished"""
+    error: str | None = None
+    """the error that made the warm-up fail, if it failed"""
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """
+        :return: the representation reported by the heartbeat and the registry file
+        """
+        return {"name": self.name, "state": self.state.value, "seconds": self.seconds, "error": self.error}
+
+
 class ProjectReadinessTracker:
     """
     Thread-safe record of the readiness of the projects warmed up by the project server, which reports every change of
@@ -101,8 +126,7 @@ class ProjectReadinessTracker:
         """
         self._on_change = on_change
         self._lock = threading.Lock()
-        self._entries: dict[str, dict[str, Any]] = {}
-        self._start_times: dict[str, float] = {}
+        self._readiness_by_root: dict[str, ProjectReadiness] = {}
 
     def begin(self, project_root: str, project_name: str) -> bool:
         """
@@ -113,11 +137,10 @@ class ProjectReadinessTracker:
         :return: whether the warm-up shall be started
         """
         with self._lock:
-            entry = self._entries.get(project_root)
-            if entry is not None and entry["state"] != ProjectState.FAILED.value:
+            readiness = self._readiness_by_root.get(project_root)
+            if readiness is not None and readiness.state != ProjectState.FAILED:
                 return False
-            self._start_times[project_root] = time.monotonic()
-            self._entries[project_root] = {"name": project_name, "state": ProjectState.LOADING.value, "seconds": None, "error": None}
+            self._readiness_by_root[project_root] = ProjectReadiness(project_name, ProjectState.LOADING, time.monotonic())
             self._on_change(self._snapshot())
             return True
 
@@ -129,21 +152,21 @@ class ProjectReadinessTracker:
         :param error: the error that made the warm-up fail; None if the project is ready
         """
         with self._lock:
-            entry = self._entries[project_root]
-            entry["state"] = (ProjectState.READY if error is None else ProjectState.FAILED).value
-            entry["seconds"] = round(time.monotonic() - self._start_times[project_root], 1)
-            entry["error"] = error
+            readiness = self._readiness_by_root[project_root]
+            readiness.state = ProjectState.READY if error is None else ProjectState.FAILED
+            readiness.seconds = round(time.monotonic() - readiness.started_at, 1)
+            readiness.error = error
             self._on_change(self._snapshot())
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """
-        :return: the readiness entries (name, state, seconds, error) by project root
+        :return: the JSON representations of the readiness records (see `ProjectReadiness.to_json_dict`) by project root
         """
         with self._lock:
             return self._snapshot()
 
     def _snapshot(self) -> dict[str, dict[str, Any]]:
-        return {root: dict(entry) for root, entry in self._entries.items()}
+        return {root: readiness.to_json_dict() for root, readiness in self._readiness_by_root.items()}
 
 
 class ProjectWarmer:
@@ -163,6 +186,7 @@ class ProjectWarmer:
         """
         self._load_project = load_project
         self._tracker = tracker
+        self._threads: list[threading.Thread] = []
 
     def start(self, project_root: str, project_name: str) -> None:
         """
@@ -172,7 +196,19 @@ class ProjectWarmer:
         :param project_name: the project's name
         """
         if self._tracker.begin(project_root, project_name):
-            threading.Thread(target=self._warm_up, args=(project_root,), name=f"warmup:{project_name}", daemon=True).start()
+            thread = threading.Thread(target=self._warm_up, args=(project_root,), name=f"warmup:{project_name}", daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+    def join(self, timeout: float) -> None:
+        """
+        Waits for the warm-ups in progress to finish.
+
+        :param timeout: the maximum time to wait in seconds (for all warm-ups together)
+        """
+        deadline = time.monotonic() + timeout
+        for thread in list(self._threads):
+            thread.join(max(0.0, deadline - time.monotonic()))
 
     def _warm_up(self, project_root: str) -> None:
         try:
@@ -270,15 +306,21 @@ class ProjectServerRegistryFile:
 class ExtendedProjectServer(ProjectServer):
     """
     The project server of the Serena fork, adding warm-up, readiness reporting, a registry file, a tool allowlist and
-    graceful shutdown to the upstream :class:`ProjectServer`; without warm-up projects and allowlist, requests are
-    handled exactly as upstream.
+    graceful shutdown to the upstream :class:`ProjectServer`. Without warm-up projects and allowlist, requests are
+    handled as upstream, except that a ``/query_project`` request whose body does not match the request model is
+    answered with status 400 (instead of 500).
 
     Routes in addition to the upstream ones:
       * ``GET /heartbeat`` additionally reports ``projects``: the readiness of the warmed-up projects by root path;
       * ``POST /warmup`` with ``{"project": <name or root>}`` starts the warm-up of a registered project (202);
       * ``POST /shutdown`` stops the server gracefully (202).
-    Rejections by the allowlist are reported with status 403 and malformed ``/query_project`` requests with status
-    400, each with the reason as plain text.
+    Rejections by the allowlist are reported with status 403, with the reason as plain text.
+    """
+
+    SHUTDOWN_WAIT_SECONDS = 30.0
+    """
+    the time for which the shutdown waits for warm-ups in progress and, separately, for a request being processed,
+    before stopping the loaded projects' language servers anyway
     """
 
     def __init__(
@@ -297,6 +339,7 @@ class ExtendedProjectServer(ProjectServer):
         self._registry = ProjectServerRegistryFile(self._port, os.getpid())
         self._readiness = ProjectReadinessTracker(on_change=self._registry.write)
         self._warmer = ProjectWarmer(self._get_project, self._readiness)
+        self._shutdown_scheduled = threading.Event()
 
     def warm_up(self, project_root_or_name: str) -> None:
         """
@@ -314,14 +357,16 @@ class ExtendedProjectServer(ProjectServer):
         """
         Runs the server until it is shut down (via ``/shutdown``, Ctrl+C, Ctrl+Break or SIGTERM), warming up the
         configured projects in the background, and finally stops the loaded projects' language servers (saving their
-        caches) and removes the registry file.
+        caches) and removes the registry file. Closing the console is not handled (the server is meant to run without
+        one; Windows terminates the process shortly after the close event).
+
+        :raises OSError: if the port is in use, before any project is loaded or the registry file is written
         """
+        self._check_port_is_free()
         self._registry.write(self._readiness.snapshot())
         if self._allowlist.tool_names:
             log.info("Accepted tools: %s", ", ".join(self._allowlist.tool_names))
-        for termination_signal in (getattr(signal, "SIGBREAK", None), signal.SIGTERM):
-            if termination_signal is not None:
-                signal.signal(termination_signal, signal.default_int_handler)
+        self._set_termination_signal_handler(signal.default_int_handler)
         for project in self._warm_projects:
             try:
                 self.warm_up(project)
@@ -331,19 +376,49 @@ class ExtendedProjectServer(ProjectServer):
         try:
             super().run()
         finally:
-            self._shut_down_projects()
-            self._registry.remove()
+            # a repeated Ctrl+C or termination request must not interrupt the clean-up
+            self._set_termination_signal_handler(signal.SIG_IGN)
+            try:
+                self._shut_down_projects()
+            finally:
+                self._registry.remove()
+
+    def _check_port_is_free(self) -> None:
+        """
+        :raises OSError: if the port is in use (e.g. by another project server, whose registry file must not be
+            overwritten)
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((self._host, self._port))
+            except OSError as e:
+                raise OSError(f"Port {self._port} on {self._host} is already in use: {e}") from e
+
+    @staticmethod
+    def _set_termination_signal_handler(handler: Any) -> None:
+        for signal_name in ("SIGINT", "SIGBREAK", "SIGTERM"):
+            termination_signal = getattr(signal, signal_name, None)
+            if termination_signal is not None:
+                signal.signal(termination_signal, handler)
 
     def _shut_down_projects(self) -> None:
-        with self._loaded_projects_lock:
-            projects = list(self._loaded_projects_by_root.values())
-            self._loaded_projects_by_root.clear()
-        for project in projects:
-            log.info("Shutting down project '%s'", project.project_name)
-            try:
-                project.shutdown(timeout=5)
-            except Exception as e:
-                log.error("Failed to shut down project '%s'", project.project_name, exc_info=e)
+        # let warm-ups in progress publish their projects and a request being processed finish; a warm-up still
+        # loading afterwards is abandoned, its language servers ending with the process (their input is closed)
+        self._warmer.join(timeout=self.SHUTDOWN_WAIT_SECONDS)
+        request_finished = self._active_project_lock.acquire(timeout=self.SHUTDOWN_WAIT_SECONDS)
+        try:
+            with self._loaded_projects_lock:
+                projects = list(self._loaded_projects_by_root.values())
+                self._loaded_projects_by_root.clear()
+            for project in projects:
+                log.info("Shutting down project '%s'", project.project_name)
+                try:
+                    project.shutdown(timeout=5)
+                except Exception as e:
+                    log.error("Failed to shut down project '%s'", project.project_name, exc_info=e)
+        finally:
+            if request_finished:
+                self._active_project_lock.release()
 
     @staticmethod
     def _text_response(message: str, status: int) -> Response:
@@ -362,14 +437,11 @@ class ExtendedProjectServer(ProjectServer):
             try:
                 query_request = QueryProjectRequest.model_validate(request.get_json())
                 self._allowlist.check_tool(query_request.tool_name)
-                return query_project_view()
+            except ValidationError as e:
+                return self._text_response(f"Invalid project query: {e}", 400)
             except ToolNotAllowedError as e:
                 return self._text_response(str(e), 403)
-            except HTTPException:
-                raise
-            except Exception as e:
-                log.warning("Rejected project query: %s", e)
-                return self._text_response(f"{type(e).__name__}: {e}", 400)
+            return query_project_view()
 
         def call_facade_method() -> Any:
             try:
@@ -406,7 +478,9 @@ class ExtendedProjectServer(ProjectServer):
             self._schedule_shutdown()
             return self._text_response("Shutting down", 202)
 
-    @staticmethod
-    def _schedule_shutdown() -> None:
-        # interrupting the main thread (shortly after the response is sent) ends the server loop, upon which run() cleans up
-        threading.Timer(0.2, _thread.interrupt_main).start()
+    def _schedule_shutdown(self) -> None:
+        # interrupting the main thread (shortly after the response is sent) ends the server loop, upon which run()
+        # cleans up; a repeated request must not interrupt the clean-up
+        if not self._shutdown_scheduled.is_set():
+            self._shutdown_scheduled.set()
+            threading.Timer(0.2, _thread.interrupt_main).start()

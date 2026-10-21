@@ -556,7 +556,8 @@ class TopLevelCommands(AutoRegisteringGroup):
         "allowed_tools",
         multiple=True,
         help="Name of a tool the server accepts (all other tools and editing operations are rejected); repeatable. "
-        "If not given, all read-only tools are accepted.",
+        "If not given, the server accepts what upstream Serena does: all read-only tools via /query_project and all "
+        "facade methods, including edits, via /call_facade_method.",
     )
     def start_project_server(
         host: str,

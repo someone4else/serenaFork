@@ -377,7 +377,7 @@ class SolidLanguageServer(ABC):
     the time in seconds for which a regular save waits for a cache file held open by another process (per cache file;
     regular saves happen after tool calls, so the wait delays the tool's response)
     """
-    FINAL_CACHE_SAVE_REPLACE_TIMEOUT = 30.0
+    FINAL_CACHE_SAVE_REPLACE_TIMEOUT = 10.0
     """the time in seconds for which the save before stopping the language server waits for a busy cache file"""
 
     # Directories that should always be ignored regardless of language:
@@ -3114,7 +3114,7 @@ class SolidLanguageServer(ABC):
         version.append(self._raw_document_symbols_cache_version())
         return tuple(version)
 
-    def _save_raw_document_symbols_cache(self, replace_timeout: float) -> None:
+    def _save_raw_document_symbols_cache(self, replace_timeout: float, final: bool) -> None:
         cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME
 
         if not self._raw_document_symbols_cache_is_modified:
@@ -3122,18 +3122,25 @@ class SolidLanguageServer(ABC):
             return
 
         log.info("Saving updated raw document symbols cache to %s", cache_file)
+        # the flag is reset before the cache is copied, such that entries added meanwhile (by another thread) keep the
+        # cache marked as modified
+        self._raw_document_symbols_cache_is_modified = False
         try:
             save_cache(
                 str(cache_file),
                 self._raw_document_symbols_cache_version(),
-                self._raw_document_symbols_cache,
+                dict(self._raw_document_symbols_cache),
                 replace_timeout=replace_timeout,
             )
-            self._raw_document_symbols_cache_is_modified = False
         except CacheFileBusyError as e:
-            log.warning("%s; the raw document symbols cache will be saved later", e)
-            self._cache_save_schedule.pause()
+            self._raw_document_symbols_cache_is_modified = True
+            if final:
+                log.error("%s; the changes to the raw document symbols cache are lost", e)
+            else:
+                log.warning("%s; the raw document symbols cache will be saved later", e)
+                self._cache_save_schedule.pause()
         except Exception as e:
+            self._raw_document_symbols_cache_is_modified = True
             log.error("Failed to save raw document symbols cache to %s: %s", cache_file, e)
 
     def _raw_document_symbols_cache_fingerprint(self) -> Hashable | None:
@@ -3183,7 +3190,7 @@ class SolidLanguageServer(ABC):
                     e,
                 )
 
-    def _save_document_symbols_cache(self, replace_timeout: float) -> None:
+    def _save_document_symbols_cache(self, replace_timeout: float, final: bool) -> None:
         cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME
 
         if not self._document_symbols_cache_is_modified:
@@ -3191,15 +3198,22 @@ class SolidLanguageServer(ABC):
             return
 
         log.info("Saving updated document symbols cache to %s", cache_file)
+        # the flag is reset before the cache is copied, such that entries added meanwhile (by another thread) keep the
+        # cache marked as modified
+        self._document_symbols_cache_is_modified = False
         try:
             save_cache(
-                str(cache_file), self._document_symbols_cache_version(), self._document_symbols_cache, replace_timeout=replace_timeout
+                str(cache_file), self._document_symbols_cache_version(), dict(self._document_symbols_cache), replace_timeout=replace_timeout
             )
-            self._document_symbols_cache_is_modified = False
         except CacheFileBusyError as e:
-            log.warning("%s; the document symbols cache will be saved later", e)
-            self._cache_save_schedule.pause()
+            self._document_symbols_cache_is_modified = True
+            if final:
+                log.error("%s; the changes to the document symbols cache are lost", e)
+            else:
+                log.warning("%s; the document symbols cache will be saved later", e)
+                self._cache_save_schedule.pause()
         except Exception as e:
+            self._document_symbols_cache_is_modified = True
             log.error("Failed to save document symbols cache to %s: %s", cache_file, e)
 
     def _load_document_symbols_cache(self) -> None:
@@ -3231,8 +3245,8 @@ class SolidLanguageServer(ABC):
             log.debug("Saving the symbol caches is paused, as a cache file was in use by another process")
             return
         replace_timeout = self.FINAL_CACHE_SAVE_REPLACE_TIMEOUT if final else self.CACHE_SAVE_REPLACE_TIMEOUT
-        self._save_raw_document_symbols_cache(replace_timeout)
-        self._save_document_symbols_cache(replace_timeout)
+        self._save_raw_document_symbols_cache(replace_timeout, final)
+        self._save_document_symbols_cache(replace_timeout, final)
 
     def request_workspace_symbol(self, query: str) -> list[ls_types.UnifiedSymbolInformation] | None:
         """
