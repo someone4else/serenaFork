@@ -13,7 +13,8 @@ def serena_version() -> str:
     """
     from serena.util.git import get_git_status
 
-    version = __version__
+    # marks the build of the fork someone4else/serenaFork (__version__ itself is kept for version comparisons)
+    version = __version__ + "+fork"
     try:
         git_status = get_git_status()
         if git_status is not None:
