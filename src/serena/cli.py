@@ -545,12 +545,27 @@ class TopLevelCommands(AutoRegisteringGroup):
         default=None,
         help="Override log level in config.",
     )
+    @click.option(
+        "--warm",
+        "warm_projects",
+        multiple=True,
+        help="Name or root path of a registered project to load (and whose language servers to start) right away; repeatable.",
+    )
+    @click.option(
+        "--allowed-tool",
+        "allowed_tools",
+        multiple=True,
+        help="Name of a tool the server accepts (all other tools and editing operations are rejected); repeatable. "
+        "If not given, all read-only tools are accepted.",
+    )
     def start_project_server(
         host: str,
         port: int | None,
         log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None,
+        warm_projects: tuple[str, ...],
+        allowed_tools: tuple[str, ...],
     ) -> None:
-        from serena.project_server import ProjectServer
+        from serena.project_server_ext import ExtendedProjectServer
 
         # initialize logging
         Logger.root.setLevel(logging.INFO)
@@ -569,7 +584,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         log.info("Starting Serena project server")
         log.info("Storing logs in %s", log_path)
 
-        server = ProjectServer(host=host, port=port)
+        server = ExtendedProjectServer(host=host, port=port, warm_projects=warm_projects, allowed_tools=allowed_tools)
         server.run()
 
     @staticmethod

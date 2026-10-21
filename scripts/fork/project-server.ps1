@@ -32,7 +32,9 @@ param(
     [string[]]$AllowedTool = @(),
     [switch]$IncludeOrphans,
     [string]$TaskName = 'SerenaProjectServer',
-    [int]$StartTimeoutSeconds = 120
+    [int]$StartTimeoutSeconds = 120,
+    # time granted to a graceful shutdown (saving large symbol caches can take a while) before the process is killed
+    [int]$ShutdownTimeoutSeconds = 120
 )
 
 $ErrorActionPreference = 'Stop'
@@ -187,11 +189,36 @@ function Invoke-Start {
     throw "Serena project server did not answer on port $Port within $StartTimeoutSeconds s; see $logDir"
 }
 
+# asks the server to shut down gracefully (stopping its language servers and saving their caches); servers without
+# the /shutdown route (upstream Serena) answer 404 and are then terminated
+function Request-GracefulShutdown([int]$ProcessId) {
+    $headers = @{}
+    $secret = Get-AuthSecret
+    if ($secret) { $headers['Authorization'] = "Bearer $secret" }
+    try {
+        Invoke-WebRequest -Uri "http://127.0.0.1:$Port/shutdown" -Method Post -Headers $headers -UseBasicParsing -TimeoutSec 5 | Out-Null
+    }
+    catch {
+        return $false
+    }
+    $deadline = (Get-Date).AddSeconds($ShutdownTimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
 function Invoke-Stop {
     $server = Get-ListeningServer
     if ($server -and $server.IsServer) {
-        Stop-ProcessTree $server.Root.ProcessId
-        Write-Output "Stopped Serena project server (PID $($server.Root.ProcessId))"
+        if (Request-GracefulShutdown $server.Listener.ProcessId) {
+            Write-Output "Shut down Serena project server gracefully (PID $($server.Root.ProcessId))"
+        }
+        else {
+            Stop-ProcessTree $server.Root.ProcessId
+            Write-Output "Terminated Serena project server (PID $($server.Root.ProcessId))"
+        }
     }
     elseif ($server) {
         throw "Port $Port is in use by a process that is not a Serena project server: $(Format-Process $server.Listener)"
