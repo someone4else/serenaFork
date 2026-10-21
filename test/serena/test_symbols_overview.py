@@ -65,13 +65,13 @@ def _overview_params(depth: int) -> SymbolOutputParams:
 
 def _overview(root: dict[str, Any], depth: int, source: str = "") -> list[LanguageServerSymbol.OutputDict]:
     symbol = LanguageServerSymbol(root)
-    return SymbolOverviewEnricher.for_file([symbol], source, "Foo.cs").to_dicts(symbol, _overview_params(depth))
+    return SymbolOverviewEnricher.from_source([symbol], source).to_dicts(symbol, _overview_params(depth))
 
 
 class TestBaseTypeClauseExtractor:
     @staticmethod
-    def _extract(source: str, name: str, kind: SymbolKind = SymbolKind.Class, line: int = 0, relative_path: str = "Foo.cs") -> str | None:
-        return BaseTypeClauseExtractor(source, relative_path).extract(LanguageServerSymbol(_symbol(name, kind, line=line)))
+    def _extract(source: str, name: str, kind: SymbolKind = SymbolKind.Class, line: int = 0) -> str | None:
+        return BaseTypeClauseExtractor(source).extract(LanguageServerSymbol(_symbol(name, kind, line=line)))
 
     def test_base_class_and_interface(self):
         assert self._extract("public class Foo : Bar, IBaz\n{\n}\n", "Foo") == ": Bar, IBaz"
@@ -104,11 +104,31 @@ class TestBaseTypeClauseExtractor:
     def test_cpp_access_specifier_is_kept(self):
         assert self._extract("class Foo : public Bar {\n};\n", "Foo") == ": public Bar"
 
-    def test_python_declarations_are_left_alone(self):
+    def test_only_languages_introducing_base_types_with_a_colon_are_considered(self):
         # In Python the colon opens the class body rather than a base type list, and a brace further down the body
-        # (here a dict literal) must not make the body count as a base type clause
-        source = 'class Foo(Bar):\n    """Doc: something."""\n\n    def to_dict(self):\n        return {"x": 1}\n'
-        assert self._extract(source, "Foo", relative_path="models.py") is None
+        # (a dict literal) must not make the body count as a base type clause
+        assert BaseTypeClauseExtractor.applies_to("Foo.cs")
+        assert BaseTypeClauseExtractor.applies_to("foo.hpp")
+        assert not BaseTypeClauseExtractor.applies_to("models.py")
+        assert not BaseTypeClauseExtractor.applies_to("Foo.java")
+
+    def test_kotlin_primary_constructor_is_skipped(self):
+        assert self._extract("class Foo(val x: Int, y: String) : Bar(x), Baz {\n}\n", "Foo") == ": Bar(x), Baz"
+
+    def test_swift_generic_constraint_is_skipped(self):
+        assert self._extract("struct Box<T: Hashable>: Container {\n}\n", "Box", kind=SymbolKind.Struct) == ": Container"
+
+    def test_cpp_specialization_with_scope_operators(self):
+        assert self._extract("class Foo<std::string> : public Bar<std::string> {\n};\n", "Foo") == ": public Bar<std::string>"
+
+    def test_cpp_final_class(self):
+        assert self._extract("class Foo final : public Bar {\n};\n", "Foo") == ": public Bar"
+
+    def test_csharp_positional_record(self):
+        assert self._extract("public record Foo(int X, string Y) : Bar(X)\n{\n}\n", "Foo") == ": Bar(X)"
+
+    def test_kotlin_class_without_base_types(self):
+        assert self._extract("class Foo(val x: Int) {\n}\n", "Foo") is None
 
     def test_declaration_without_a_brace_is_skipped(self):
         assert self._extract("public class Foo : Bar\n" + "\n" * BaseTypeClauseExtractor.MAX_DECLARATION_LINES, "Foo") is None
@@ -214,6 +234,33 @@ class TestNameEnrichment:
         assert result["children"][0]["name"] == "Foo : IBaz"
 
 
+class TestEnricherForFile:
+    @staticmethod
+    def _class_symbol() -> LanguageServerSymbol:
+        return LanguageServerSymbol(_symbol("Foo", SymbolKind.Class, [_symbol("Run", SymbolKind.Method, line=3)], line=1))
+
+    def test_file_in_another_encoding_than_the_projects_is_read_with_the_detected_one(self, tmp_path):
+        # a legacy C# file with a Russian comment, while the project is configured for UTF-8
+        source = "// Класс для проверки кодировки\npublic class Foo : Bar\n{\n    public void Run() { }\n}\n"
+        (tmp_path / "Foo.cs").write_bytes(source.encode("cp1251"))
+        symbol = self._class_symbol()
+        enricher = SymbolOverviewEnricher.for_file([symbol], "Foo.cs", str(tmp_path / "Foo.cs"), "utf-8")
+        (result,) = enricher.to_dicts(symbol, _overview_params(depth=1))
+        assert result["name"] == "Foo : Bar"
+
+    def test_files_of_other_languages_are_not_read(self, tmp_path):
+        symbol = LanguageServerSymbol(_symbol("Foo", SymbolKind.Class, line=0, relative_path="foo.py"))
+        enricher = SymbolOverviewEnricher.for_file([symbol], "foo.py", str(tmp_path / "missing.py"), "utf-8")
+        (result,) = enricher.to_dicts(symbol, _overview_params(depth=0))
+        assert result["name"] == "Foo"
+
+    def test_unreadable_file_yields_an_overview_without_base_types(self, tmp_path):
+        symbol = self._class_symbol()
+        enricher = SymbolOverviewEnricher.for_file([symbol], "Foo.cs", str(tmp_path / "missing.cs"), "utf-8")
+        (result,) = enricher.to_dicts(symbol, _overview_params(depth=1))
+        assert result["name"] == "Foo"
+
+
 class TestEnrichedSymbolsOverviewRenderer:
     _AGENT: Any = SimpleNamespace(serena_config=SimpleNamespace(default_max_tool_answer_chars=100_000))
 
@@ -222,7 +269,7 @@ class TestEnrichedSymbolsOverviewRenderer:
         root = LanguageServerSymbol(
             _symbol("MyApp", SymbolKind.Namespace, [_symbol("Foo", SymbolKind.Class, [_symbol("Foo", SymbolKind.Method, line=4)], line=2)])
         )
-        enricher = SymbolOverviewEnricher.for_file([root], source, "Foo.cs")
+        enricher = SymbolOverviewEnricher.from_source([root], source)
         renderer = EnrichedSymbolsOverviewRenderer(self._AGENT, -1, _overview_params(depth=0), enricher)
         return LspSymbolCollection([root], renderer)
 
@@ -277,6 +324,17 @@ def test_csharp_overview_shows_base_types_and_constructors(serena_agent: SerenaA
 
     greeter_overview = serena_agent.get_tool(GetSymbolsOverviewTool).apply_ex(relative_path="Services/ConsoleGreeter.cs")
     assert "ConsoleGreeter : IGreeter" in greeter_overview
+
+
+@pytest.mark.csharp
+@pytest.mark.parametrize("serena_agent", [LanguageServerId.CSHARP], indirect=True)
+def test_csharp_facade_overview_survives_pickling(serena_agent: SerenaAgent):
+    # the project server returns facade results pickled, and the client renders them
+    method = serena_agent.get_repl().entrypoint.get_facade_("lsp").get_method("get_symbols_overview")
+    result = serena_agent.execute_task(lambda: method("Models/Person.cs"))
+    rendered = result.represent()
+    assert "IsAdult() : bool" in rendered
+    assert pickle.loads(pickle.dumps(result)).represent() == rendered
 
 
 @pytest.mark.python

@@ -5,6 +5,7 @@ callables show their signatures, classes, interfaces and structs show their base
 as such.
 """
 
+import logging
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -14,10 +15,12 @@ from typing import TYPE_CHECKING
 from serena.repl.api.lsp_api import LspSymbolsOverviewRenderer, SymbolOutputParams
 from serena.symbol import LanguageServerSymbol, SymbolDictGrouper
 from solidlsp.ls_types import SymbolKind
+from solidlsp.ls_utils import FileUtils
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
 
+log = logging.getLogger(__name__)
 
 SymbolPredicate = Callable[[LanguageServerSymbol], bool]
 
@@ -48,8 +51,9 @@ class BaseTypeClauseExtractor:
     Extracts the base type clause (e.g. ``: BaseClass, IInterface``) of a class, interface or struct from its source
     declaration.
 
-    Supported declaration forms include access modifiers and keywords such as ``abstract`` or ``sealed``, generic type
-    parameters, ``where`` constraints, nested generic base types, ``record class``/``record struct`` as well as
+    Supported declaration forms include access modifiers and keywords such as ``abstract``, ``sealed`` or ``final``,
+    generic type parameters (also with constraints containing colons, as in Swift), primary constructors (Kotlin, C#
+    records), ``where`` constraints, nested generic base types, ``record class``/``record struct`` as well as
     declarations spanning several lines.
     Only files of languages in which a colon introduces the base type list of a brace-delimited declaration are
     considered (C#, C++, Kotlin, Swift): in Python, for instance, the very same colon opens the class body, and a
@@ -65,24 +69,31 @@ class BaseTypeClauseExtractor:
     COLON_BASE_LIST_EXTENSIONS = frozenset({".cs", ".cpp", ".cc", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".kt", ".kts", ".swift"})
     """the extensions of the source files whose declarations introduce base types with a colon"""
 
-    def __init__(self, source: str, relative_path: str) -> None:
+    _BRACKET_PAIRS = {"<": ">", "(": ")"}
+    _DECLARATION_KEYWORDS_AFTER_NAME = frozenset({"final"})
+
+    def __init__(self, source: str) -> None:
         """
-        :param source: the content of the file declaring the symbols
-        :param relative_path: the path of the file, which determines whether its declarations are considered
+        :param source: the content of the file declaring the symbols (with line endings normalised to LF)
         """
-        self._lines = source.splitlines()
-        self._applies = os.path.splitext(relative_path)[1].lower() in self.COLON_BASE_LIST_EXTENSIONS
+        # LSP line numbers count line breaks only, unlike str.splitlines, which also splits at form feeds etc.
+        self._lines = source.split("\n")
+
+    @classmethod
+    def applies_to(cls, relative_path: str) -> bool:
+        """
+        :param relative_path: the path of a source file
+        :return: whether the file's language introduces base types with a colon
+        """
+        return os.path.splitext(relative_path)[1].lower() in cls.COLON_BASE_LIST_EXTENSIONS
 
     def extract(self, symbol: LanguageServerSymbol) -> str | None:
         """
         :param symbol: a symbol declared in the file
-        :return: the base type clause (``: BaseClass, IInterface``), or None if the file's language does not introduce
-            base types with a colon, the symbol is not of an enriched kind, has no base types or its declaration could
-            not be parsed
+        :return: the base type clause (``: BaseClass, IInterface``), or None if the symbol is not of an enriched kind,
+            has no base types or its declaration could not be parsed
         """
-        if not self._applies or symbol.symbol_kind not in self.ENRICHED_KINDS:
-            return None
-        if symbol.line is None or symbol.line >= len(self._lines):
+        if symbol.symbol_kind not in self.ENRICHED_KINDS or symbol.line is None or symbol.line >= len(self._lines):
             return None
 
         # collect the declaration lines up to the opening brace (none in sight: not a brace-language declaration)
@@ -99,15 +110,62 @@ class BaseTypeClauseExtractor:
         declaration = declaration[: declaration.find("{")]
         declaration = re.sub(r"\bwhere\b.*$", "", declaration, flags=re.DOTALL).strip()
 
-        # after the type name, [^:]* consumes the optional generic type parameters, and ':' introduces the base types
-        match = re.search(
-            rf"\b(?:class|interface|struct|record(?:\s+(?:class|struct))?)\s+{re.escape(symbol.name)}\b[^:]*:\s*(.+)",
-            declaration,
-        )
+        match = re.search(rf"\b(?:class|interface|struct|record(?:\s+(?:class|struct))?)\s+{re.escape(symbol.name)}\b", declaration)
         if match is None:
             return None
-        bases = match.group(1).strip().rstrip(",").strip()
+        bases = self._base_type_list_after_name(declaration, match.end())
         return ": " + bases if bases else None
+
+    @classmethod
+    def _base_type_list_after_name(cls, declaration: str, position: int) -> str | None:
+        """
+        :param declaration: the declaration (on a single line, without its body)
+        :param position: the position right after the declared type's name
+        :return: the base type list, which follows the colon after the generic type parameters, the primary constructor
+            and keywords such as ``final``; None if there is no such colon
+        """
+        # skip bracketed groups (which may contain colons themselves) and keywords between the name and the colon
+        while True:
+            while position < len(declaration) and declaration[position].isspace():
+                position += 1
+            if position >= len(declaration):
+                return None
+            opening = declaration[position]
+            if opening in cls._BRACKET_PAIRS:
+                position = cls._skip_bracketed_group(declaration, position)
+                if position < 0:
+                    return None
+                continue
+            keyword = re.match(r"\w+", declaration[position:])
+            if keyword is not None and keyword.group(0) in cls._DECLARATION_KEYWORDS_AFTER_NAME:
+                position += len(keyword.group(0))
+                continue
+            break
+
+        # a single colon (unlike the scope operator "::") introduces the base types
+        if declaration[position] != ":" or declaration[position : position + 2] == "::":
+            return None
+        bases = declaration[position + 1 :].strip().rstrip(",").strip()
+        return bases or None
+
+    @classmethod
+    def _skip_bracketed_group(cls, text: str, position: int) -> int:
+        """
+        :param text: the text
+        :param position: the position of an opening bracket
+        :return: the position after the matching closing bracket (nested brackets of either kind are balanced), or -1
+            if the group is not closed
+        """
+        expected_closings: list[str] = []
+        for index in range(position, len(text)):
+            char = text[index]
+            if char in cls._BRACKET_PAIRS:
+                expected_closings.append(cls._BRACKET_PAIRS[char])
+            elif expected_closings and char == expected_closings[-1]:
+                expected_closings.pop()
+                if not expected_closings:
+                    return index + 1
+        return -1
 
 
 class SymbolOverviewEnricher:
@@ -136,14 +194,34 @@ class SymbolOverviewEnricher:
         self._base_type_clauses = base_type_clauses
 
     @classmethod
-    def for_file(cls, symbols: Sequence[LanguageServerSymbol], source: str, relative_path: str) -> "SymbolOverviewEnricher":
+    def for_file(
+        cls, symbols: Sequence[LanguageServerSymbol], relative_path: str, abs_path: str, encoding: str
+    ) -> "SymbolOverviewEnricher":
         """
         :param symbols: the top-level symbols of a file
-        :param source: the content of the file
-        :param relative_path: the path of the file
+        :param relative_path: the path of the file relative to the project root
+        :param abs_path: the absolute path of the file
+        :param encoding: the project's encoding; files that cannot be decoded with it are read with a detected one
+        :return: an enricher for the overview of the file; without base type clauses if the file's language does not
+            introduce base types with a colon or the file cannot be read
+        """
+        if not BaseTypeClauseExtractor.applies_to(relative_path):
+            return cls({})
+        try:
+            source = FileUtils.read_file(abs_path, encoding)
+        except Exception as e:
+            log.warning("Cannot read %s for its base type clauses: %s", relative_path, e)
+            return cls({})
+        return cls.from_source(symbols, source)
+
+    @classmethod
+    def from_source(cls, symbols: Sequence[LanguageServerSymbol], source: str) -> "SymbolOverviewEnricher":
+        """
+        :param symbols: the top-level symbols of a file of a language introducing base types with a colon
+        :param source: the content of the file (with line endings normalised to LF)
         :return: an enricher for the overview of the file
         """
-        extractor = BaseTypeClauseExtractor(source, relative_path)
+        extractor = BaseTypeClauseExtractor(source)
         base_type_clauses: dict[SymbolPosition, str] = {}
 
         def collect(symbol: LanguageServerSymbol) -> None:
@@ -199,6 +277,13 @@ class SymbolOverviewEnricher:
     def _to_enriched_dict(
         self, symbol: LanguageServerSymbol, output_params: SymbolOutputParams, depth: int, include: SymbolPredicate
     ) -> LanguageServerSymbol.OutputDict:
+        """
+        :param symbol: the symbol
+        :param output_params: the output parameters of the overview
+        :param depth: the depth to use instead of the one in the output parameters
+        :param include: the child inclusion predicate of the output parameters (or one including all children)
+        :return: the enriched dictionary representing the symbol
+        """
         output_dict = symbol.to_dict(
             name_path=output_params.name_path,
             name=output_params.name,
@@ -302,7 +387,14 @@ class EnrichedSymbolsOverviewRenderer(LspSymbolsOverviewRenderer):
     def symbol_dicts_(
         self, symbols: list[LanguageServerSymbol], info_by_symbol: dict[LanguageServerSymbol, str]
     ) -> list[LanguageServerSymbol.OutputDict]:
-        # a transparent container may map to a dictionary of one of its descendants, and the overview carries no info
+        """
+        :param symbols: the top-level symbols of the file
+        :param info_by_symbol: not supported (a symbols overview never includes hover info); must be empty
+        :return: the enriched dictionaries of the symbols, which need not correspond one-to-one to the symbols, as a
+            chain of structural containers is represented by the innermost container
+        """
+        if info_by_symbol:
+            raise ValueError("The enriched symbols overview does not support per-symbol info")
         symbol_dicts: list[LanguageServerSymbol.OutputDict] = []
         for symbol in symbols:
             symbol_dicts.extend(self._enricher.to_dicts(symbol, self._output_params))
