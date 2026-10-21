@@ -844,6 +844,7 @@ class TestBackreferenceExpansion:
         with pytest.raises(ValueError, match="does not exist"):
             replacer.find_occurrences(files, r"id=(\w+)", r"[$!2]")
 
+
 class TestSearchFilesResourceSkips:
     """search_files must not spend resources on files that are useless to search (binary or huge):
     such files must be skipped without ever being read into memory.
@@ -884,7 +885,7 @@ class TestLocalProjectFileProxyIsSearchable:
     @staticmethod
     def _proxy(tmp_path, relative_path: str) -> LocalProjectFileProxy:
         project = SimpleNamespace(project_root=str(tmp_path), project_config=SimpleNamespace(encoding="utf-8"))
-        return LocalProjectFileProxy(relative_path, project)  # type: ignore[arg-type]
+        return LocalProjectFileProxy(relative_path, project)
 
     def test_source_file_is_searchable(self, tmp_path):
         (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
