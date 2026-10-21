@@ -13,6 +13,15 @@ from sensai.util.logging import LogTime
 from sensai.util.string import ToStringMixin
 
 log = logging.getLogger(__name__)
+
+
+class ReportedTaskError(Exception):
+    """
+    An error which the failing task has already reported (logged), such that the executor forwards it to the waiting
+    caller without logging it again.
+    """
+
+
 T = TypeVar("T")
 
 
@@ -67,7 +76,10 @@ class TaskExecutor:
                             self.future.set_result(result)
                 except Exception as e:
                     if not self.future.done():
-                        log.error(f"Error during execution of {self.name}: {e}", exc_info=e)
+                        if isinstance(e, ReportedTaskError):
+                            log.debug(f"Task {self.name} failed: {e}")
+                        else:
+                            log.error(f"Error during execution of {self.name}: {e}", exc_info=e)
                         self.future.set_exception(e)
 
             thread = Thread(target=run_task, name=self.name)

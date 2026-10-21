@@ -20,6 +20,7 @@ from serena.memories.memory_manager import MemoryManager
 from serena.project import Project
 from serena.prompt_factory import PromptFactory
 from serena.repl.facade import SUCCESS_RESULT
+from serena.task_executor import ReportedTaskError
 from serena.util.class_decorators import singleton
 from serena.util.inspection import iter_subclasses
 from serena.util.text_utils import TextOutputUtils
@@ -115,9 +116,9 @@ class ApplyMethodProtocol(Protocol):
         pass
 
 
-class ToolCallError(Exception):
+class ToolCallError(ReportedTaskError):
     """
-    Represents an error raised during a tool call execution
+    Represents an error raised during a tool call execution (which the tool logs, see `Tool.apply_ex`)
     """
 
     def __init__(self, error_message: str):
@@ -366,18 +367,16 @@ class Tool(Component):
                 # record tool usage
                 self.agent.record_tool_usage(apply_kwargs, result, self)
 
-            except ToolCallError:
+            except ToolCallError as e:
+                log.warning(f"Tool could not complete: {e}")
                 raise
             except Exception as e:
                 msg = f"{e.__class__.__name__}: {e}"
-                # Lazy import to avoid an import cycle (serena.symbol imports back into the tools).
+                # lazy import to avoid an import cycle (serena.symbol imports back into the tools)
                 from serena.symbol import SymbolRetrievalError
 
+                # an expected, caller-facing outcome is logged concisely, so it is not mistaken for an internal error
                 if isinstance(e, SymbolRetrievalError):
-                    # Expected, caller-facing outcome (e.g. a symbol lookup that matched nothing or
-                    # was ambiguous): the message is returned to the caller so it can correct its
-                    # arguments. Log it concisely, without a stack trace, so it is not mistaken for
-                    # an internal error.
                     log.warning(f"Tool could not complete: {msg}")
                 else:
                     log.error(msg, exc_info=e)

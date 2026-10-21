@@ -29,12 +29,10 @@ NAME_PATH_SEP = "/"
 
 
 class SymbolRetrievalError(ValueError):
-    """Raised when a symbol lookup does not resolve to a unique symbol (no match, or several
-    ambiguous matches). This is an expected, caller-facing condition -- typically a wrong name
-    path or an incorrect ``relative_path`` argument (e.g. pointing at an interface instead of the
-    implementation) -- rather than an internal error. Tools report the message to the caller and
-    log it concisely (without a stack trace). Subclasses ``ValueError`` for backward compatibility
-    with callers that catch it.
+    """
+    Error for a symbol lookup that does not resolve to a unique symbol (no match, or several ambiguous matches).
+    It is an expected, caller-facing outcome (typically a wrong name path or relative path) rather than an internal
+    error; it subclasses ``ValueError`` for callers catching the latter.
     """
 
 
