@@ -149,18 +149,21 @@ def breadth_first_file_scan(root_dir: str, is_ignored_path: Callable[[str], bool
     :param is_ignored_path: predicate on paths relative to ``root_dir``; ignored directories are not traversed
         and ignored files are not yielded
     """
-    queue = [root_dir]
+    queue = [(root_dir, "")]
     while queue:
-        current_dir = queue.pop(0)
+        current_dir, current_relative_dir = queue.pop(0)
         try:
             for item in os.listdir(current_dir):
                 if item.startswith("."):
                     continue
                 item_path = os.path.join(current_dir, item)
-                if is_ignored_path(os.path.relpath(item_path, root_dir)):
+                # composed rather than computed with os.path.relpath, which fails for files with reserved Windows
+                # device names (a stray file named "nul" resolves to the device path \\.\nul)
+                item_relative_path = os.path.join(current_relative_dir, item) if current_relative_dir else item
+                if is_ignored_path(item_relative_path):
                     continue
                 if os.path.isdir(item_path):
-                    queue.append(item_path)
+                    queue.append((item_path, item_relative_path))
                 elif os.path.isfile(item_path):
                     yield item_path
         except (PermissionError, OSError):
