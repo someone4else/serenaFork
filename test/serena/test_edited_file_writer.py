@@ -1,18 +1,23 @@
 """
-Tests for the fork's preservation of line endings when edited files are written (`SerenaConfig.preserve_line_endings`).
+Tests for the fork's writing of edited files: preservation of line endings (`SerenaConfig.preserve_line_endings`) and
+the confinement of a process's writes to writable roots.
 """
 
+import os
 import shutil
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 
 from serena.code_editor import EditedFileContext, LanguageServerCodeEditor
 from serena.config.serena_config import LineEnding, SerenaConfig
-from serena.edited_file_writer import EditedFileWriter
+from serena.edited_file_writer import EditedFileWriter, WritableRoots, WriteConfinement, WriteOutsideWritableRootsError
 from serena.language_backend import BuiltinLanguageBackend
 from serena.project import Project
 from serena.repl.api.edit_api import EditApi
@@ -109,6 +114,62 @@ class TestEditedFileWriter:
         EditedFileWriter("utf-8", "\n", preserve_line_endings=False).write(path, "a\nc\nb\n")
 
         assert Path(path).read_bytes() == b"a\nc\nb\n"
+
+
+class TestWriteConfinement:
+    @pytest.fixture
+    def roots(self, tmp_path: Path) -> Iterator[Path]:
+        """
+        A writable root containing a worktree, beside a main directory outside of it, the process being confined to
+        the writable root for the duration of the test.
+        """
+        (tmp_path / "worktrees" / "wt1").mkdir(parents=True)
+        (tmp_path / "main").mkdir()
+        (tmp_path / "main" / "File.cs").write_bytes(b"main\n")
+        WriteConfinement.confine(WritableRoots([str(tmp_path / "worktrees")]))
+        try:
+            yield tmp_path
+        finally:
+            WriteConfinement.confine(None)
+
+    def test_confined_writes_inside_the_roots_succeed_and_outside_fail(self, roots: Path) -> None:
+        writer = EditedFileWriter("utf-8", "\n", preserve_line_endings=False)
+
+        writer.write(str(roots / "worktrees" / "wt1" / "File.cs"), "worktree\n")
+        for outside in (roots / "main" / "File.cs", roots / "worktrees" / "wt1" / ".." / ".." / "main" / "File.cs"):
+            with pytest.raises(WriteOutsideWritableRootsError):
+                writer.write(str(outside), "overwritten\n")
+
+        assert (roots / "worktrees" / "wt1" / "File.cs").read_bytes() == b"worktree\n"
+        assert (roots / "main" / "File.cs").read_bytes() == b"main\n"
+
+    @pytest.mark.skipif(os.name != "nt", reason="directory junctions exist on Windows only")
+    def test_confined_write_through_a_junction_to_outside_fails(self, roots: Path) -> None:
+        junction = roots / "worktrees" / "wt1" / "linked"
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(roots / "main")], check=True, capture_output=True)
+
+        with pytest.raises(WriteOutsideWritableRootsError):
+            EditedFileWriter("utf-8", "\n", preserve_line_endings=False).write(str(junction / "File.cs"), "overwritten\n")
+
+        assert (roots / "main" / "File.cs").read_bytes() == b"main\n"
+
+    def test_confined_file_rename_to_outside_fails(self, roots: Path) -> None:
+        (roots / "worktrees" / "wt1" / "Old.cs").write_bytes(b"old\n")
+        editor = SimpleNamespace(project_root=str(roots / "worktrees" / "wt1"), _relative_path_from_uri=lambda uri: uri)
+        rename = LanguageServerCodeEditor.EditOperationRenameFile(cast(Any, editor), "Old.cs", os.path.join("..", "..", "main", "New.cs"))
+
+        with pytest.raises(WriteOutsideWritableRootsError):
+            rename.apply()
+
+        assert (roots / "worktrees" / "wt1" / "Old.cs").exists()
+        assert not (roots / "main" / "New.cs").exists()
+
+    def test_unconfined_process_writes_anywhere(self, tmp_path: Path) -> None:
+        path = tmp_path / "anywhere.txt"
+
+        EditedFileWriter("utf-8", "\n", preserve_line_endings=False).write(str(path), "written\n")
+
+        assert path.read_bytes() == b"written\n"
 
 
 class TestCreateTextFile:

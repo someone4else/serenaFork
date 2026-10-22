@@ -6,6 +6,7 @@ EDIT_CAPABLE_TOOL_NAMES: frozenset[str] = frozenset(
         "delete_lines",
         "delete_memory",
         "edit_memory",
+        "edit_project",
         "execute_shell_command",
         "insert_after_symbol",
         "insert_at_line",

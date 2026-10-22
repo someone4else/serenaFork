@@ -1,0 +1,11 @@
+description: Enables tools that query and edit other projects (e.g. git worktrees) via the project server
+prompt: |
+  You can use the 'query_project' tool to read symbols of other Serena projects (e.g. git worktrees) without
+  activating them, and the 'edit_project' tool to edit them with Serena's editing tools.
+  Address a worktree project by its root path. Use other means of editing only for non-symbolic changes.
+  If 'edit_project' reports that the outcome of an edit is unknown, read the file before repeating the edit.
+excluded_tools: []
+included_optional_tools:
+  - list_queryable_projects
+  - query_project
+  - edit_project

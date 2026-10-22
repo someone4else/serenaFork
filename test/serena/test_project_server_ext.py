@@ -16,23 +16,27 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from flask import Flask
 
 from serena.config.serena_config import SerenaConfig
 from serena.constants import SERENA_MANAGED_DIR_NAME
+from serena.edited_file_writer import WritableRoots
 from serena.project_server import ProjectServer
 from serena.project_server_ext import (
     ExtendedProjectServer,
+    ProjectEditClient,
+    ProjectEditError,
     ProjectReadinessTracker,
     ProjectServerRegistryFile,
     ProjectServerSettingsError,
     ProjectUsageGate,
     ProjectWarmer,
     ToolAllowlist,
-    WritableRoots,
 )
 from serena.repl.facade import FacadeMethodInfo
 from serena.tools import FindSymbolTool, RenameSymbolTool
+from serena.tools.tools_base import ToolCallError
 
 SECRET = "test-shared-secret"
 AUTH = {"Authorization": f"Bearer {SECRET}"}
@@ -602,3 +606,131 @@ class TestRegistrationAndUnloading:
         finally:
             release.set()
             unloading.join(timeout=5)
+
+
+class TestEditRoute:
+    """
+    Edits via ``/edit_project`` with a mocked agent, whose editing tool returns or raises what a test sets up.
+    """
+
+    @pytest.fixture
+    def server(self, tmp_path: Path) -> ExtendedProjectServer:
+        self.worktree = tmp_path / "worktrees" / "wt1"
+        self.read_only_worktree = tmp_path / "worktrees" / "frozen"
+        self.main = tmp_path / "main"
+        server = _make_server(tmp_path, allowed_tools=("find_symbol",), mock_handlers=False, writable_roots=(str(tmp_path / "worktrees"),))
+        registered = {}
+        for name, root, read_only in (("wt1", self.worktree, False), ("frozen", self.read_only_worktree, True), ("main", self.main, False)):
+            root.mkdir(parents=True)
+            registered[name] = SimpleNamespace(project_root=root, project_config=SimpleNamespace(project_name=name, read_only=read_only))
+            server._loaded_projects_by_root[str(root)] = MagicMock()
+        _mocked_agent(server).serena_config.get_registered_project.side_effect = lambda key: registered.get(key)
+        _mocked_agent(server).serena_config.tool_timeout = 240
+        self.tool = _mocked_agent(server).get_tool_by_name.return_value
+        self.tool.apply_ex.return_value = "edited"
+        return server
+
+    @staticmethod
+    def _edit(
+        server: ExtendedProjectServer, project: str, tool_name: str = "replace_symbol_body", params: str = '{"name_path": "A"}'
+    ) -> Any:
+        with server._app.test_client() as client:
+            return client.post(
+                "/edit_project", json={"project_name": project, "tool_name": tool_name, "tool_params_json": params}, headers=AUTH
+            )
+
+    def test_editing_tool_is_executed_in_a_project_within_the_writable_roots(self, server: ExtendedProjectServer) -> None:
+        response = self._edit(server, "wt1")
+
+        assert (response.status_code, response.get_data(as_text=True)) == (200, "edited")
+        self.tool.apply_ex.assert_called_once_with(catch_exceptions=False, name_path="A")
+
+    @pytest.mark.parametrize(
+        ("project", "tool_name", "status"),
+        [
+            pytest.param("main", "replace_symbol_body", 403, id="outside_the_writable_roots"),
+            pytest.param("frozen", "replace_symbol_body", 403, id="read_only_project"),
+            pytest.param("wt1", "find_symbol", 403, id="read_only_tool"),
+            pytest.param("wt1", "execute_shell_command", 403, id="other_editing_tool"),
+            pytest.param("unknown", "replace_symbol_body", 404, id="unknown_project"),
+        ],
+    )
+    def test_inadmissible_edit_is_rejected_with_its_reason(
+        self, server: ExtendedProjectServer, project: str, tool_name: str, status: int
+    ) -> None:
+        response = self._edit(server, project, tool_name)
+
+        assert response.status_code == status
+        assert response.get_data(as_text=True)
+        self.tool.apply_ex.assert_not_called()
+
+    def test_malformed_edit_requests_are_rejected(self, server: ExtendedProjectServer) -> None:
+        with server._app.test_client() as client:
+            assert client.post("/edit_project", json={"project_name": "wt1"}, headers=AUTH).status_code == 400
+        assert self._edit(server, "wt1", params="{not json").status_code == 400
+
+    def test_failing_tool_is_reported_with_status_422(self, server: ExtendedProjectServer) -> None:
+        self.tool.apply_ex.side_effect = ToolCallError("No symbol with name A found")
+
+        response = self._edit(server, "wt1")
+
+        assert response.status_code == 422
+        assert "No symbol with name A found" in response.get_data(as_text=True)
+
+    def test_timed_out_edit_is_reported_as_of_unknown_outcome(self, server: ExtendedProjectServer) -> None:
+        _mocked_agent(server).serena_config.tool_timeout = 0
+        self.tool.apply_ex.side_effect = ToolCallError("Tool execution timed out after 0 seconds.")
+
+        response = self._edit(server, "wt1")
+
+        assert response.status_code == 504
+        assert "unknown" in response.get_data(as_text=True)
+
+    def test_server_without_writable_roots_rejects_all_edits(self, server: ExtendedProjectServer) -> None:
+        server._writable_roots = WritableRoots()
+
+        assert self._edit(server, "wt1").status_code == 403
+
+
+class TestProjectEditClient:
+    @pytest.fixture
+    def client(self, monkeypatch: pytest.MonkeyPatch) -> ProjectEditClient:
+        monkeypatch.setattr(
+            "serena.project_server.requests_lib.get", lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None)
+        )
+        serena_config = SimpleNamespace(tool_timeout=240, auth_secret=SECRET)
+        return ProjectEditClient(cast(SerenaConfig, serena_config), port=24299)
+
+    def test_client_waits_longer_than_the_server_and_returns_the_result(
+        self, client: ProjectEditClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        timeouts: list[float] = []
+
+        def post(url: str, json: Any, headers: Any, timeout: float) -> Any:
+            timeouts.append(timeout)
+            return SimpleNamespace(status_code=200, text="edited")
+
+        monkeypatch.setattr("serena.project_server_ext.requests_lib.post", post)
+
+        assert client.edit_project("wt1", "replace_symbol_body", "{}") == "edited"
+        assert timeouts[0] > 240
+
+    @pytest.mark.parametrize(("status", "expected"), [(403, "403"), (422, "422"), (504, "read the file before repeating")])
+    def test_rejected_edit_raises_the_servers_reason(
+        self, client: ProjectEditClient, monkeypatch: pytest.MonkeyPatch, status: int, expected: str
+    ) -> None:
+        monkeypatch.setattr(
+            "serena.project_server_ext.requests_lib.post", lambda *args, **kwargs: SimpleNamespace(status_code=status, text="reason")
+        )
+
+        with pytest.raises(ProjectEditError, match=expected):
+            client.edit_project("wt1", "replace_symbol_body", "{}")
+
+    def test_unanswered_edit_is_reported_as_of_unknown_outcome(self, client: ProjectEditClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        def time_out(*args: Any, **kwargs: Any) -> Any:
+            raise requests.Timeout()
+
+        monkeypatch.setattr("serena.project_server_ext.requests_lib.post", time_out)
+
+        with pytest.raises(ProjectEditError, match="outcome of the edit is unknown"):
+            client.edit_project("wt1", "replace_symbol_body", "{}")

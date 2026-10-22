@@ -22,13 +22,16 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+import requests as requests_lib
 from flask import Response, request
 from pydantic import ValidationError
 from werkzeug.exceptions import HTTPException
 
 from serena import serena_version
-from serena.config.serena_config import RegisteredProject, SerenaPaths
-from serena.project_server import CallFacadeMethodRequest, ProjectServer, QueryProjectRequest
+from serena.config.serena_config import RegisteredProject, SerenaConfig, SerenaPaths
+from serena.edited_file_writer import WritableRoots, WriteConfinement
+from serena.project_server import CallFacadeMethodRequest, ProjectServer, ProjectServerClient, QueryProjectRequest
+from serena.tools.tools_base import ToolCallError
 from serena.util.file_system import write_file_atomic
 
 if TYPE_CHECKING:
@@ -85,39 +88,20 @@ class ProjectConflictError(ProjectRequestRejectedError):
     status = 409
 
 
-class WritableRoots:
+class ToolFailedError(ProjectRequestRejectedError):
     """
-    The directories within which the project server registers and edits projects (``--writable-root``).
+    Raised when a tool executed for a request fails (e.g. because a symbol is not found).
     """
 
-    def __init__(self, roots: Sequence[str] = ()) -> None:
-        """
-        :param roots: the directories; empty for none
-        """
-        self._roots = [self._normalise(root) for root in roots]
+    status = 422
 
-    @property
-    def is_empty(self) -> bool:
-        return not self._roots
 
-    def contains(self, path: str) -> bool:
-        """
-        :param path: a path
-        :return: whether the path, with symbolic links and junctions resolved, lies strictly inside one of the roots
-        """
-        normalised_path = self._normalise(path)
-        for root in self._roots:
-            try:
-                if normalised_path != root and os.path.commonpath([root, normalised_path]) == root:
-                    return True
-            except ValueError:
-                # paths on different drives
-                continue
-        return False
+class EditOutcomeUnknownError(ProjectRequestRejectedError):
+    """
+    Raised when an edit did not complete within the tool timeout; it may still be applied afterwards.
+    """
 
-    @staticmethod
-    def _normalise(path: str) -> str:
-        return os.path.normcase(os.path.realpath(path))
+    status = 504
 
 
 class ProjectUsageGate:
@@ -483,9 +467,13 @@ class ExtendedProjectServer(ProjectServer):
       * ``POST /unload`` with ``{"project": <name or root>, "forget": <bool>}`` stops a project's language servers
         (saving their caches) and releases the project, which is also removed from the server's registered projects
         if ``forget`` is true (200);
+      * ``POST /edit_project`` with the body of ``/query_project`` executes an editing tool (`EDITING_TOOL_NAMES`) in
+        a project within the writable roots and returns its result (200);
       * ``POST /shutdown`` stops the server gracefully (202).
     Rejections are reported as plain text: by the allowlist and the writable roots with status 403, for unknown
-    projects with 404 and for requests conflicting with a project's state (e.g. its unloading) with 409.
+    projects with 404, for requests conflicting with a project's state (e.g. its unloading) with 409, failures of
+    editing tools with 422, and edits whose outcome is unknown (time-out) with 504.
+    With writable roots, all writes of edited files of the server's process are confined to them.
     """
 
     SHUTDOWN_WAIT_SECONDS = 30.0
@@ -495,6 +483,10 @@ class ExtendedProjectServer(ProjectServer):
     """
     UNLOAD_WAIT_SECONDS = 60.0
     """the time for which the unloading of a project waits for the requests using it"""
+    EDITING_TOOL_NAMES = frozenset(
+        ("replace_symbol_body", "insert_after_symbol", "insert_before_symbol", "replace_content", "rename_symbol", "safe_delete_symbol")
+    )
+    """the tools accepted by ``/edit_project``"""
 
     def __init__(
         self,
@@ -525,6 +517,8 @@ class ExtendedProjectServer(ProjectServer):
         self._warm_projects = list(warm_projects)
         self._pinned_roots: set[str] = set()
         self._writable_roots = WritableRoots(writable_roots)
+        if not self._writable_roots.is_empty:
+            WriteConfinement.confine(self._writable_roots)
         self._usage = ProjectUsageGate()
         self._registration_lock = threading.Lock()
         self._registry = ProjectServerRegistryFile(self._port, os.getpid())
@@ -639,6 +633,49 @@ class ExtendedProjectServer(ProjectServer):
         # the released project's caches are freed now rather than at the next collection
         gc.collect()
         return registered_project, project is not None
+
+    def edit_project(self, edit_request: QueryProjectRequest) -> str:
+        """
+        Executes an editing tool in a project within the writable roots, in the same manner as ``/query_project``
+        executes a read-only tool.
+
+        :param edit_request: the request, naming the project (by name or root path), the tool and its parameters
+        :return: the tool's result
+        :raises ProjectNotAllowedError: if the tool is not one of `EDITING_TOOL_NAMES`, or the project is outside the
+            writable roots or read-only
+        :raises ProjectNotFoundError: if the project is not registered
+        :raises ToolFailedError: if the tool fails
+        :raises EditOutcomeUnknownError: if the tool does not complete within the tool timeout
+        """
+        if edit_request.tool_name not in self.EDITING_TOOL_NAMES:
+            raise ProjectNotAllowedError(
+                f"Tool '{edit_request.tool_name}' is not accepted by /edit_project; accepted: {', '.join(sorted(self.EDITING_TOOL_NAMES))}"
+            )
+        try:
+            registered_project = self.get_serena_config().get_registered_project(edit_request.project_name)
+            params = json.loads(edit_request.tool_params_json)
+        except ValueError as e:
+            raise ProjectRequestRejectedError(str(e)) from e
+        if registered_project is None:
+            raise ProjectNotFoundError(f"Project '{edit_request.project_name}' is not registered with this server")
+        if not self._writable_roots.contains(str(registered_project.project_root)):
+            raise ProjectNotAllowedError(
+                f"Project '{registered_project.project_root}' is not within a writable root of this server (--writable-root)"
+            )
+        if registered_project.project_config.read_only:
+            raise ProjectNotAllowedError(f"Project '{registered_project.project_root}' is read-only")
+
+        project = self._get_project(edit_request.project_name)
+        with self._active_project_lock, self._agent.active_project_context(project):
+            tool = self._agent.get_tool_by_name(edit_request.tool_name)
+            start = time.monotonic()
+            try:
+                return tool.apply_ex(catch_exceptions=False, **params)
+            except ToolCallError as e:
+                # a timed-out tool keeps running in the background, possibly applying the edit later
+                if time.monotonic() - start >= self.get_serena_config().tool_timeout:
+                    raise EditOutcomeUnknownError(f"The outcome of the edit is unknown (it may still be applied): {e}") from e
+                raise ToolFailedError(str(e)) from e
 
     def _project_load_lock(self, project_root: str) -> threading.Lock:
         """
@@ -839,6 +876,21 @@ class ExtendedProjectServer(ProjectServer):
             content = {"project": self._project_json_dict(registered_project), "unloaded": was_loaded, "forgotten": forget}
             return self._json_response(content, 200)
 
+        @app.route("/edit_project", methods=["POST"])
+        def edit_project() -> Any:
+            try:
+                edit_request = QueryProjectRequest.model_validate(request.get_json(silent=True))
+            except ValidationError as e:
+                return self._text_response(f"Invalid project edit: {e}", 400)
+
+            def apply_edit() -> Response:
+                try:
+                    return self._text_response(self.edit_project(edit_request), 200)
+                except ProjectRequestRejectedError as e:
+                    return self._text_response(str(e), e.status)
+
+            return self._process_using_project(edit_request.project_name, apply_edit)
+
         @app.route("/shutdown", methods=["POST"])
         def shutdown() -> Any:
             log.info("Shutdown requested")
@@ -851,3 +903,54 @@ class ExtendedProjectServer(ProjectServer):
         if not self._shutdown_scheduled.is_set():
             self._shutdown_scheduled.set()
             threading.Timer(0.2, _thread.interrupt_main).start()
+
+
+class ProjectEditError(Exception):
+    """
+    Raised when the project server does not apply an edit; the message gives the server's reason.
+    """
+
+
+class ProjectEditClient(ProjectServerClient):
+    """
+    Client for the ``/edit_project`` route of a running :class:`ExtendedProjectServer`.
+    """
+
+    TIMEOUT_MARGIN_SECONDS = 30.0
+    """
+    the time by which the client waits longer than the server's tool timeout, such that the server's report of a
+    timed-out edit reaches the client
+    """
+
+    def __init__(self, serena_config: SerenaConfig, host: str = "127.0.0.1", port: int | None = None) -> None:
+        """
+        :param serena_config: Serena's configuration, providing the authentication secret and the tool timeout
+        :param host: the host address of the project server
+        :param port: the port of the project server; if None, use default
+        :raises ConnectionError: if the project server is not reachable
+        """
+        super().__init__(serena_config, host=host, port=port)
+        self._edit_timeout = serena_config.tool_timeout + self.TIMEOUT_MARGIN_SECONDS
+
+    def edit_project(self, project_name: str, tool_name: str, tool_params_json: str) -> str:
+        """
+        Edits a project by executing an editing tool in its context.
+
+        :param project_name: the name or root path of the project
+        :param tool_name: the name of the editing tool
+        :param tool_params_json: the parameters to pass to the tool, encoded as a JSON string
+        :return: the tool's result
+        :raises ProjectEditError: if the server rejects the edit, the tool fails or the outcome of the edit is unknown
+        """
+        payload = QueryProjectRequest(project_name=project_name, tool_name=tool_name, tool_params_json=tool_params_json).model_dump()
+        try:
+            response = requests_lib.post(f"{self._base_url}/edit_project", json=payload, headers=self._headers, timeout=self._edit_timeout)
+        except requests_lib.Timeout as e:
+            raise ProjectEditError(
+                f"The project server did not answer within {self._edit_timeout} seconds; the outcome of the edit is unknown "
+                "(read the file before repeating the edit)"
+            ) from e
+        if response.status_code == 200:
+            return response.text
+        hint = " (read the file before repeating the edit)" if response.status_code == 504 else ""
+        raise ProjectEditError(f"The project server did not apply the edit ({response.status_code}): {response.text}{hint}")

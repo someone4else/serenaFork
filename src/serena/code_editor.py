@@ -15,7 +15,7 @@ from solidlsp import SolidLanguageServer, ls_types
 from solidlsp.ls import LSPFileBuffer
 from solidlsp.ls_utils import PathUtils, TextStepper, TextUtils
 
-from .edited_file_writer import EditedFileWriter
+from .edited_file_writer import EditedFileWriter, WriteConfinement
 from .project import Project
 from .util.file_proxy import FileProxy
 
@@ -375,6 +375,8 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
         def apply(self) -> None:
             old_abs_path = os.path.join(self._code_editor.project_root, self._old_relative_path)
             new_abs_path = os.path.join(self._code_editor.project_root, self._new_relative_path)
+            WriteConfinement.check(old_abs_path)
+            WriteConfinement.check(new_abs_path)
             os.rename(old_abs_path, new_abs_path)
 
     def _workspace_edit_to_edit_operations(self, workspace_edit: ls_types.WorkspaceEdit) -> list["LanguageServerCodeEditor.EditOperation"]:
