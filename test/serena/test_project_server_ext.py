@@ -5,6 +5,7 @@ graceful shutdown), exercised through the HTTP routes of a server whose agent is
 import json
 import os
 import pickle
+import shutil
 import signal
 import socket
 import threading
@@ -17,13 +18,18 @@ from unittest.mock import MagicMock
 import pytest
 from flask import Flask
 
+from serena.config.serena_config import SerenaConfig
+from serena.constants import SERENA_MANAGED_DIR_NAME
 from serena.project_server import ProjectServer
 from serena.project_server_ext import (
     ExtendedProjectServer,
     ProjectReadinessTracker,
     ProjectServerRegistryFile,
+    ProjectServerSettingsError,
+    ProjectUsageGate,
     ProjectWarmer,
     ToolAllowlist,
+    WritableRoots,
 )
 from serena.repl.facade import FacadeMethodInfo
 from serena.tools import FindSymbolTool, RenameSymbolTool
@@ -32,7 +38,9 @@ SECRET = "test-shared-secret"
 AUTH = {"Authorization": f"Bearer {SECRET}"}
 
 
-def _make_server(registry_dir: Path, allowed_tools: tuple[str, ...] = (), mock_handlers: bool = True) -> ExtendedProjectServer:
+def _make_server(
+    registry_dir: Path, allowed_tools: tuple[str, ...] = (), mock_handlers: bool = True, writable_roots: tuple[str, ...] = ()
+) -> ExtendedProjectServer:
     """
     Creates a server with a mocked agent (no language servers), as the upstream project server tests do; unless
     `mock_handlers` is False, the upstream query and facade call handlers are replaced by stubs echoing the request.
@@ -49,6 +57,10 @@ def _make_server(registry_dir: Path, allowed_tools: tuple[str, ...] = (), mock_h
     server._app = Flask(__name__)
     server._allowlist = ToolAllowlist(allowed_tools)
     server._warm_projects = []
+    server._pinned_roots = set()
+    server._writable_roots = WritableRoots(writable_roots)
+    server._usage = ProjectUsageGate()
+    server._registration_lock = threading.Lock()
     server._registry = ProjectServerRegistryFile(server._port, os.getpid(), directory=str(registry_dir))
     server._readiness = ProjectReadinessTracker(on_change=server._registry.write)
     server._warmer = ProjectWarmer(server._get_project, server._readiness)
@@ -374,3 +386,219 @@ class TestShutdown:
             assert client.post("/shutdown", headers=AUTH).status_code == 202
             assert client.post("/shutdown", headers=AUTH).status_code == 202
         assert len(timers) == 1
+
+
+class TestSettings:
+    def test_writable_roots_require_an_allowlist_and_a_local_host(self) -> None:
+        with pytest.raises(ProjectServerSettingsError, match="allowed-tool"):
+            ExtendedProjectServer(writable_roots=("/worktrees",))
+        with pytest.raises(ProjectServerSettingsError, match="local host"):
+            ExtendedProjectServer(host="0.0.0.0", allowed_tools=("find_symbol",), writable_roots=("/worktrees",))
+
+    def test_writable_roots_contain_paths_strictly_inside_them(self, tmp_path: Path) -> None:
+        roots = WritableRoots([str(tmp_path / "worktrees")])
+
+        assert roots.contains(str(tmp_path / "worktrees" / "wt1"))
+        assert not roots.contains(str(tmp_path / "worktrees"))
+        assert not roots.contains(str(tmp_path / "worktrees" / ".." / "main"))
+        assert not roots.contains(str(tmp_path / "main"))
+        assert not WritableRoots().contains(str(tmp_path / "worktrees" / "wt1"))
+
+
+class TestRegistrationAndUnloading:
+    """
+    Registration and unloading of projects at runtime, with Serena's configuration in a temporary file.
+    """
+
+    @pytest.fixture
+    def server(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ExtendedProjectServer:
+        config_path = tmp_path / "serena_config.yml"
+        config_path.write_text("projects: []\n", encoding="utf-8")
+        monkeypatch.setattr(SerenaConfig, "_determine_config_file_path", classmethod(lambda cls: str(config_path)))
+        self.worktrees = tmp_path / "worktrees"
+        self.worktrees.mkdir()
+
+        server = _make_server(tmp_path, allowed_tools=("find_symbol",), writable_roots=(str(self.worktrees),))
+        serena_config = SerenaConfig.from_config_file()
+        serena_config.auth_secret = SECRET
+        _mocked_agent(server).serena_config = serena_config
+        self.started_warm_ups: list[str] = []
+        server._warmer = SimpleNamespace(start=lambda root, name: self.started_warm_ups.append(root))
+        return server
+
+    def _make_project(self, dir_name: str, project_name: str | None = None) -> Path:
+        project_dir = self.worktrees / dir_name
+        (project_dir / SERENA_MANAGED_DIR_NAME).mkdir(parents=True)
+        (project_dir / SERENA_MANAGED_DIR_NAME / "project.yml").write_text(
+            f'project_name: "{project_name or dir_name}"\nlanguage_servers: []\n', encoding="utf-8"
+        )
+        return project_dir
+
+    @staticmethod
+    def _registered_roots_in_file() -> list[Path]:
+        return [Path(project.project_root) for project in SerenaConfig.from_config_file(generate_if_missing=False).projects]
+
+    @staticmethod
+    def _post(server: ExtendedProjectServer, route: str, body: dict[str, Any]) -> Any:
+        with server._app.test_client() as client:
+            return client.post(route, json=body, headers=AUTH)
+
+    def _load(self, server: ExtendedProjectServer, project_dir: Path) -> MagicMock:
+        """Publishes a mocked loaded instance of a registered project, which reports itself ready."""
+        project = MagicMock()
+        root = str(project_dir.resolve())
+        server._loaded_projects_by_root[root] = project
+        server._readiness.begin(root, project_dir.name)
+        server._readiness.finish(root)
+        return project
+
+    def test_registered_project_is_known_to_the_server_and_written_to_the_configuration_once(self, server: ExtendedProjectServer) -> None:
+        project_dir = self._make_project("wt1")
+
+        first = self._post(server, "/register", {"project": str(project_dir)})
+        second = self._post(server, "/register", {"project": str(project_dir)})
+
+        assert first.status_code == 200
+        assert first.get_json() == {"project": {"name": "wt1", "root": str(project_dir.resolve())}, "added": True}
+        assert second.status_code == 200
+        assert second.get_json()["added"] is False
+        assert self._registered_roots_in_file() == [project_dir.resolve()]
+        assert self._post(server, "/warmup", {"project": str(project_dir)}).status_code == 202
+        assert self.started_warm_ups == [str(project_dir.resolve())]
+
+    def test_registration_outside_the_writable_roots_or_without_configuration_is_rejected(
+        self, server: ExtendedProjectServer, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "main"
+        (outside / SERENA_MANAGED_DIR_NAME).mkdir(parents=True)
+        (self.worktrees / "bare").mkdir()
+
+        assert self._post(server, "/register", {"project": str(outside)}).status_code == 403
+        assert self._post(server, "/register", {"project": str(self.worktrees / "bare")}).status_code == 404
+        assert self._post(server, "/register", {}).status_code == 400
+        assert self._registered_roots_in_file() == []
+
+    def test_name_of_an_existing_project_conflicts_but_one_of_a_removed_root_is_replaced(self, server: ExtendedProjectServer) -> None:
+        first = self._make_project("wave1", project_name="ews@integration")
+        second = self._make_project("wave2", project_name="ews@integration")
+        assert self._post(server, "/register", {"project": str(first)}).status_code == 200
+
+        conflict = self._post(server, "/register", {"project": str(second)})
+        shutil.rmtree(first)
+        replacement = self._post(server, "/register", {"project": str(second)})
+
+        assert conflict.status_code == 409
+        assert "ews@integration" in conflict.get_data(as_text=True)
+        assert replacement.status_code == 200
+        assert self._registered_roots_in_file() == [second.resolve()]
+        registered = server.get_serena_config().get_registered_project("ews@integration")
+        assert registered is not None
+        assert registered.project_root == second.resolve()
+
+    def test_unloaded_project_is_shut_down_and_no_longer_reported(self, server: ExtendedProjectServer) -> None:
+        project_dir = self._make_project("wt1")
+        self._post(server, "/register", {"project": str(project_dir)})
+        project = self._load(server, project_dir)
+
+        response = self._post(server, "/unload", {"project": "wt1"})
+
+        assert response.status_code == 200
+        assert response.get_json() == {"project": {"name": "wt1", "root": str(project_dir.resolve())}, "unloaded": True, "forgotten": False}
+        project.shutdown.assert_called_once()
+        with server._app.test_client() as client:
+            assert str(project_dir.resolve()) not in client.get("/heartbeat", headers=AUTH).get_json()["projects"]
+        assert str(project_dir.resolve()) not in json.loads(Path(server._registry.path).read_text(encoding="utf-8"))["projects"]
+        assert server.get_serena_config().get_registered_project("wt1") is not None
+
+    def test_forgotten_project_is_unknown_to_the_server_and_dropped_from_the_configuration_with_the_next_change(
+        self, server: ExtendedProjectServer
+    ) -> None:
+        forgotten = self._make_project("wt1")
+        other = self._make_project("wt2")
+        self._post(server, "/register", {"project": str(forgotten)})
+        self._load(server, forgotten)
+        projects_before = iter(server.get_serena_config().projects)
+
+        response = self._post(server, "/unload", {"project": str(forgotten), "forget": True})
+        self._post(server, "/register", {"project": str(other)})
+
+        assert response.get_json()["forgotten"] is True
+        assert self._post(server, "/unload", {"project": str(forgotten)}).status_code == 404
+        assert self._registered_roots_in_file() == [other.resolve()]
+        # a reader iterating the registered projects during the unloading still sees all of them
+        assert [p.project_root for p in projects_before] == [forgotten.resolve()]
+
+    def test_project_warmed_up_at_startup_or_being_warmed_up_is_not_unloaded(self, server: ExtendedProjectServer) -> None:
+        pinned = self._make_project("pinned")
+        warming = self._make_project("warming")
+        for project_dir in (pinned, warming):
+            self._post(server, "/register", {"project": str(project_dir)})
+        server._pinned_roots.add(str(pinned.resolve()))
+        server._readiness.begin(str(warming.resolve()), "warming")
+
+        assert self._post(server, "/unload", {"project": "pinned"}).status_code == 409
+        assert self._post(server, "/unload", {"project": "warming"}).status_code == 409
+        assert self._post(server, "/unload", {"project": "unknown"}).status_code == 404
+
+    def test_unloading_waits_for_requests_using_the_project_and_rejects_new_ones(
+        self, server: ExtendedProjectServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project_dir = self._make_project("wt1")
+        self._post(server, "/register", {"project": str(project_dir)})
+        project = self._load(server, project_dir)
+        entered, release = threading.Event(), threading.Event()
+        num_queries = [0]
+
+        def query(req: Any) -> str:
+            num_queries[0] += 1
+            if num_queries[0] == 1:
+                entered.set()
+                release.wait(timeout=10)
+            return "queried"
+
+        monkeypatch.setattr(server, "_query_project", query)
+        responses: dict[str, Any] = {}
+        body = {"project_name": "wt1", "tool_name": "find_symbol", "tool_params_json": "{}"}
+        running_query = threading.Thread(target=lambda: responses.update(running=self._post(server, "/query_project", body)))
+        running_query.start()
+        assert entered.wait(timeout=5)
+        unloading = threading.Thread(target=lambda: responses.update(unload=self._post(server, "/unload", {"project": "wt1"})))
+        unloading.start()
+
+        # a query arriving while the unloading waits is rejected, and the project is not shut down meanwhile
+        deadline = time.monotonic() + 5
+        while self._post(server, "/query_project", body).status_code != 409:
+            assert time.monotonic() < deadline
+        project.shutdown.assert_not_called()
+
+        release.set()
+        running_query.join(timeout=5)
+        unloading.join(timeout=5)
+        assert responses["running"].get_data(as_text=True) == "queried"
+        assert responses["unload"].status_code == 200
+        project.shutdown.assert_called_once()
+
+    def test_queries_for_other_projects_are_answered_while_a_project_shuts_down(
+        self, server: ExtendedProjectServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unloaded_dir = self._make_project("wt1")
+        other_dir = self._make_project("wt2")
+        for project_dir in (unloaded_dir, other_dir):
+            self._post(server, "/register", {"project": str(project_dir)})
+        unloaded = self._load(server, unloaded_dir)
+        self._load(server, other_dir)
+        shutting_down, release = threading.Event(), threading.Event()
+        unloaded.shutdown.side_effect = lambda timeout: (shutting_down.set(), release.wait(timeout=10))
+        monkeypatch.setattr(server, "_query_project", lambda req: f"queried {req.project_name}")
+
+        unloading = threading.Thread(target=lambda: self._post(server, "/unload", {"project": "wt1"}))
+        unloading.start()
+        try:
+            assert shutting_down.wait(timeout=5)
+            start = time.monotonic()
+            response = self._post(server, "/query_project", {"project_name": "wt2", "tool_name": "find_symbol", "tool_params_json": "{}"})
+            assert response.get_data(as_text=True) == "queried wt2"
+            assert time.monotonic() - start < 2
+        finally:
+            release.set()
+            unloading.join(timeout=5)

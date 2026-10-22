@@ -2,10 +2,12 @@
 """
 Extensions of the Serena fork for a long-running project server: projects are warmed up at startup and their readiness
 is reported by the heartbeat, a registry file lets clients find the server, an allowlist restricts the tools the server
-accepts, and a shutdown route stops the server gracefully (saving the language servers' caches).
+accepts, projects within writable roots (e.g. git worktrees) can be registered and unloaded at runtime, and a shutdown
+route stops the server gracefully (saving the language servers' caches).
 """
 
 import _thread
+import gc
 import json
 import logging
 import os
@@ -13,7 +15,8 @@ import signal
 import socket
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -24,7 +27,7 @@ from pydantic import ValidationError
 from werkzeug.exceptions import HTTPException
 
 from serena import serena_version
-from serena.config.serena_config import SerenaPaths
+from serena.config.serena_config import RegisteredProject, SerenaPaths
 from serena.project_server import CallFacadeMethodRequest, ProjectServer, QueryProjectRequest
 from serena.util.file_system import write_file_atomic
 
@@ -36,10 +39,144 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+class ProjectServerSettingsError(ValueError):
+    """
+    Raised when the project server is created with an inadmissible combination of settings.
+    """
+
+
 class ToolNotAllowedError(Exception):
     """
     Raised when a request asks the project server for a tool or facade method outside of its allowlist.
     """
+
+
+class ProjectRequestRejectedError(Exception):
+    """
+    Raised when the project server rejects a request concerning a project; the message is the reason reported to the
+    client, along with the HTTP status `status`.
+    """
+
+    status = 400
+
+
+class ProjectNotFoundError(ProjectRequestRejectedError):
+    """
+    Raised when a request refers to a project that is not registered or has no project configuration.
+    """
+
+    status = 404
+
+
+class ProjectNotAllowedError(ProjectRequestRejectedError):
+    """
+    Raised when a request refers to a project outside of the project server's writable roots.
+    """
+
+    status = 403
+
+
+class ProjectConflictError(ProjectRequestRejectedError):
+    """
+    Raised when a request conflicts with the state of a project (e.g. a project being unloaded); unless stated
+    otherwise in the message, the request can be repeated later.
+    """
+
+    status = 409
+
+
+class WritableRoots:
+    """
+    The directories within which the project server registers and edits projects (``--writable-root``).
+    """
+
+    def __init__(self, roots: Sequence[str] = ()) -> None:
+        """
+        :param roots: the directories; empty for none
+        """
+        self._roots = [self._normalise(root) for root in roots]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self._roots
+
+    def contains(self, path: str) -> bool:
+        """
+        :param path: a path
+        :return: whether the path, with symbolic links and junctions resolved, lies strictly inside one of the roots
+        """
+        normalised_path = self._normalise(path)
+        for root in self._roots:
+            try:
+                if normalised_path != root and os.path.commonpath([root, normalised_path]) == root:
+                    return True
+            except ValueError:
+                # paths on different drives
+                continue
+        return False
+
+    @staticmethod
+    def _normalise(path: str) -> str:
+        return os.path.normcase(os.path.realpath(path))
+
+
+class ProjectUsageGate:
+    """
+    Admission of requests to the projects of the project server: a request uses a project (identified by its root
+    path) while it is processed, and a project that is being unloaded admits no requests, its unloading waiting for
+    the requests that use it.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._num_users_by_root: dict[str, int] = {}
+        self._unloading_roots: set[str] = set()
+
+    @contextmanager
+    def use(self, project_root: str) -> Iterator[None]:
+        """
+        Context for a request using a project.
+
+        :param project_root: the project's root path
+        :raises ProjectConflictError: if the project is being unloaded
+        """
+        with self._condition:
+            if project_root in self._unloading_roots:
+                raise ProjectConflictError(f"Project '{project_root}' is being unloaded")
+            self._num_users_by_root[project_root] = self._num_users_by_root.get(project_root, 0) + 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                num_users = self._num_users_by_root[project_root] - 1
+                if num_users > 0:
+                    self._num_users_by_root[project_root] = num_users
+                else:
+                    del self._num_users_by_root[project_root]
+                self._condition.notify_all()
+
+    @contextmanager
+    def unloading(self, project_root: str, timeout: float) -> Iterator[None]:
+        """
+        Context for the unloading of a project, which is entered once no request uses the project, new requests for
+        the project being rejected from the start of the wait until the end of the context.
+
+        :param project_root: the project's root path
+        :param timeout: the maximum time in seconds to wait for the requests using the project
+        :raises ProjectConflictError: if the project is already being unloaded or still in use after the timeout
+        """
+        with self._condition:
+            if project_root in self._unloading_roots:
+                raise ProjectConflictError(f"Project '{project_root}' is already being unloaded")
+            self._unloading_roots.add(project_root)
+            if not self._condition.wait_for(lambda: project_root not in self._num_users_by_root, timeout=timeout):
+                self._unloading_roots.discard(project_root)
+                raise ProjectConflictError(f"Project '{project_root}' is still in use after {timeout} seconds")
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._unloading_roots.discard(project_root)
 
 
 class ToolAllowlist:
@@ -158,6 +295,25 @@ class ProjectReadinessTracker:
             readiness.error = error
             self._on_change(self._snapshot())
 
+    def forget(self, project_root: str) -> None:
+        """
+        Removes the readiness record of a project, if any.
+
+        :param project_root: the project's root path
+        """
+        with self._lock:
+            if self._readiness_by_root.pop(project_root, None) is not None:
+                self._on_change(self._snapshot())
+
+    def is_loading(self, project_root: str) -> bool:
+        """
+        :param project_root: the project's root path
+        :return: whether the project's warm-up is in progress
+        """
+        with self._lock:
+            readiness = self._readiness_by_root.get(project_root)
+            return readiness is not None and readiness.state == ProjectState.LOADING
+
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """
         :return: the JSON representations of the readiness records (see `ProjectReadiness.to_json_dict`) by project root
@@ -196,6 +352,7 @@ class ProjectWarmer:
         :param project_name: the project's name
         """
         if self._tracker.begin(project_root, project_name):
+            self._threads = [t for t in self._threads if t.is_alive()]
             thread = threading.Thread(target=self._warm_up, args=(project_root,), name=f"warmup:{project_name}", daemon=True)
             self._threads.append(thread)
             thread.start()
@@ -313,8 +470,13 @@ class ExtendedProjectServer(ProjectServer):
     Routes in addition to the upstream ones:
       * ``GET /heartbeat`` additionally reports ``projects``: the readiness of the warmed-up projects by root path;
       * ``POST /warmup`` with ``{"project": <name or root>}`` starts the warm-up of a registered project (202);
+      * ``POST /register`` with ``{"project": <root>}`` registers a project within the writable roots (200);
+      * ``POST /unload`` with ``{"project": <name or root>, "forget": <bool>}`` stops a project's language servers
+        (saving their caches) and releases the project, which is also removed from the server's registered projects
+        if ``forget`` is true (200);
       * ``POST /shutdown`` stops the server gracefully (202).
-    Rejections by the allowlist are reported with status 403, with the reason as plain text.
+    Rejections are reported as plain text: by the allowlist and the writable roots with status 403, for unknown
+    projects with 404 and for requests conflicting with a project's state (e.g. its unloading) with 409.
     """
 
     SHUTDOWN_WAIT_SECONDS = 30.0
@@ -322,36 +484,189 @@ class ExtendedProjectServer(ProjectServer):
     the time for which the shutdown waits for warm-ups in progress and, separately, for a request being processed,
     before stopping the loaded projects' language servers anyway
     """
+    UNLOAD_WAIT_SECONDS = 60.0
+    """the time for which the unloading of a project waits for the requests using it"""
 
     def __init__(
-        self, host: str = "127.0.0.1", port: int | None = None, warm_projects: Sequence[str] = (), allowed_tools: Sequence[str] = ()
+        self,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+        warm_projects: Sequence[str] = (),
+        allowed_tools: Sequence[str] = (),
+        writable_roots: Sequence[str] = (),
     ) -> None:
         """
         :param host: the host address to listen on
         :param port: the port to listen on; if None, use default
-        :param warm_projects: the names or root paths of the projects to warm up when the server starts
+        :param warm_projects: the names or root paths of the projects to warm up when the server starts (which cannot
+            be unloaded)
         :param allowed_tools: the names of the tools the server accepts; empty for no restriction
+        :param writable_roots: the directories within which projects can be registered at runtime; empty for none.
+            They require an allowlist (without it, facade methods would edit any project) and a local host.
+        :raises ProjectServerSettingsError: if writable roots are given without allowlist or for a non-local host
         """
+        if writable_roots and not allowed_tools:
+            raise ProjectServerSettingsError("Writable roots (--writable-root) require an allowlist of tools (--allowed-tool)")
+        if writable_roots and host not in ("127.0.0.1", "localhost", "::1"):
+            raise ProjectServerSettingsError(f"Writable roots (--writable-root) require a local host address, not '{host}'")
+
         # the routes, which are set up by the base class constructor, depend on the allowlist
         self._allowlist = ToolAllowlist(allowed_tools)
         super().__init__(host=host, port=port)
         self._warm_projects = list(warm_projects)
+        self._pinned_roots: set[str] = set()
+        self._writable_roots = WritableRoots(writable_roots)
+        self._usage = ProjectUsageGate()
+        self._registration_lock = threading.Lock()
         self._registry = ProjectServerRegistryFile(self._port, os.getpid())
         self._readiness = ProjectReadinessTracker(on_change=self._registry.write)
         self._warmer = ProjectWarmer(self._get_project, self._readiness)
         self._shutdown_scheduled = threading.Event()
 
-    def warm_up(self, project_root_or_name: str) -> None:
+    def warm_up(self, project_root_or_name: str) -> str:
         """
         Starts the warm-up of a registered project, unless it is already loading or ready.
 
         :param project_root_or_name: the project's name or root path
+        :return: the project's root path
         :raises ValueError: if the project is not registered (or the name is ambiguous)
         """
         registered_project = self.get_serena_config().get_registered_project(project_root_or_name)
         if registered_project is None:
             raise ValueError(f"Project '{project_root_or_name}' is not registered with Serena.")
-        self._warmer.start(str(registered_project.project_root), registered_project.project_config.project_name)
+        project_root = str(registered_project.project_root)
+        self._warmer.start(project_root, registered_project.project_config.project_name)
+        return project_root
+
+    def register_project(self, project_root: str) -> tuple[RegisteredProject, bool]:
+        """
+        Registers a project with the server and in Serena's configuration file, unless it is registered already.
+        A registered project of the same name whose root no longer exists (e.g. a removed git worktree) is replaced.
+
+        :param project_root: the project's root path, which must lie within the writable roots and contain a project
+            configuration file
+        :return: the registered project and whether it was newly registered
+        :raises ProjectNotAllowedError: if the root is not within the writable roots
+        :raises ProjectNotFoundError: if there is no project configuration file
+        :raises ProjectConflictError: if another registered project with an existing root has the same name
+        """
+        if not self._writable_roots.contains(project_root):
+            raise ProjectNotAllowedError(f"Project root '{project_root}' is not within a writable root of this server (--writable-root)")
+        serena_config = self.get_serena_config()
+
+        with self._registration_lock:
+            # an already registered project is kept
+            for registered_project in serena_config.projects:
+                if registered_project.matches_root_path(project_root):
+                    return registered_project, False
+
+            # the new project's name must identify it unambiguously
+            if not os.path.isfile(serena_config.get_project_yml_location(project_root)):
+                raise ProjectNotFoundError(f"No project configuration found in '{project_root}'")
+            new_project = RegisteredProject.from_project_root(project_root, serena_config=serena_config)
+            stale_projects = []
+            for registered_project in serena_config.projects:
+                if registered_project.project_name == new_project.project_name:
+                    if registered_project.project_root.is_dir():
+                        raise ProjectConflictError(
+                            f"Project name '{new_project.project_name}' is already used by '{registered_project.project_root}'; "
+                            "a different name is required"
+                        )
+                    stale_projects.append(registered_project)
+
+            # the project list is replaced rather than modified, as it is read without locking
+            if stale_projects:
+                serena_config.projects = [p for p in serena_config.projects if all(p is not s for s in stale_projects)]
+            serena_config.add_registered_project(new_project)
+        log.info("Registered project '%s' (%s)", new_project.project_name, new_project.project_root)
+        return new_project, True
+
+    def unload_project(self, project_root_or_name: str, forget: bool = False) -> tuple[RegisteredProject, bool]:
+        """
+        Unloads a project: once no request uses it any more, its language servers are stopped (saving their caches),
+        the project is released, and its readiness is no longer reported. Requests for the project meanwhile are
+        rejected; afterwards, the project is loaded anew when requested (unless it was forgotten).
+
+        :param project_root_or_name: the project's name or root path
+        :param forget: whether to also remove the project from the server's registered projects (the registration
+            in Serena's configuration file is left to the caller)
+        :return: the project and whether it was loaded
+        :raises ProjectNotFoundError: if the project is not registered
+        :raises ProjectConflictError: if the project was warmed up at startup, is being warmed up or still in use
+        """
+        serena_config = self.get_serena_config()
+        try:
+            registered_project = serena_config.get_registered_project(project_root_or_name)
+        except ValueError as e:
+            raise ProjectRequestRejectedError(str(e)) from e
+        if registered_project is None:
+            raise ProjectNotFoundError(f"Project '{project_root_or_name}' is not registered with this server")
+        project_root = str(registered_project.project_root)
+        if project_root in self._pinned_roots:
+            raise ProjectConflictError(f"Project '{project_root}' is warmed up at startup (--warm) and is not unloaded")
+
+        with self._usage.unloading(project_root, timeout=self.UNLOAD_WAIT_SECONDS):
+            if self._readiness.is_loading(project_root):
+                raise ProjectConflictError(f"Project '{project_root}' is being warmed up")
+            with self._project_load_lock(project_root):
+                with self._loaded_projects_lock:
+                    project = self._loaded_projects_by_root.pop(project_root, None)
+                if project is not None:
+                    log.info("Unloading project '%s'", project.project_name)
+                    try:
+                        project.shutdown(timeout=5)
+                    except Exception as e:
+                        log.error("Failed to shut down project '%s'", project.project_name, exc_info=e)
+                self._readiness.forget(project_root)
+
+                # the registered project holds the project instance; it is replaced by a fresh one (or removed), the
+                # project list being replaced rather than modified, as it is read without locking
+                with self._registration_lock:
+                    remaining_projects = [p for p in serena_config.projects if p is not registered_project]
+                    if not forget:
+                        remaining_projects.append(RegisteredProject(project_root, registered_project.project_config))
+                    serena_config.projects = remaining_projects
+
+        # the released project's caches are freed now rather than at the next collection
+        gc.collect()
+        return registered_project, project is not None
+
+    def _project_load_lock(self, project_root: str) -> threading.Lock:
+        """
+        :param project_root: a project's root path
+        :return: the lock under which the project is loaded (see `ProjectServer._get_project`)
+        """
+        with self._loaded_projects_lock:
+            return self._project_load_locks_by_root.setdefault(project_root, threading.Lock())
+
+    def _find_project_root(self, project_root_or_name: str) -> str | None:
+        """
+        :param project_root_or_name: a project's name or root path
+        :return: the root path of the registered project, or None if there is none (or the name is ambiguous)
+        """
+        try:
+            registered_project = self.get_serena_config().get_registered_project(project_root_or_name)
+        except ValueError:
+            return None
+        return None if registered_project is None else str(registered_project.project_root)
+
+    def _process_using_project(self, project_root_or_name: str, view: Callable[[], Any]) -> Any:
+        """
+        Processes a request concerning a project while using the project (see `ProjectUsageGate`).
+
+        :param project_root_or_name: the name or root path of the project the request concerns
+        :param view: the view function processing the request
+        :return: the view function's response, or a rejection if the project is being unloaded
+        """
+        project_root = self._find_project_root(project_root_or_name)
+        if project_root is None:
+            # the view function reports the unknown project
+            return view()
+        try:
+            with self._usage.use(project_root):
+                return view()
+        except ProjectRequestRejectedError as e:
+            return self._text_response(str(e), e.status)
 
     def run(self) -> None:
         """
@@ -369,7 +684,7 @@ class ExtendedProjectServer(ProjectServer):
         self._set_termination_signal_handler(signal.default_int_handler)
         for project in self._warm_projects:
             try:
-                self.warm_up(project)
+                self._pinned_roots.add(self.warm_up(project))
             except ValueError as e:
                 log.error("Cannot warm up project: %s", e)
 
@@ -424,6 +739,14 @@ class ExtendedProjectServer(ProjectServer):
     def _text_response(message: str, status: int) -> Response:
         return Response(message, status=status, mimetype="text/plain")
 
+    @staticmethod
+    def _json_response(content: dict[str, Any], status: int) -> Response:
+        return Response(json.dumps(content), status=status, mimetype="application/json")
+
+    @staticmethod
+    def _project_json_dict(registered_project: RegisteredProject) -> dict[str, str]:
+        return {"name": registered_project.project_name, "root": str(registered_project.project_root)}
+
     def _setup_routes(self) -> None:
         super()._setup_routes()
         app = self._app
@@ -441,7 +764,7 @@ class ExtendedProjectServer(ProjectServer):
                 return self._text_response(f"Invalid project query: {e}", 400)
             except ToolNotAllowedError as e:
                 return self._text_response(str(e), 403)
-            return query_project_view()
+            return self._process_using_project(query_request.project_name, query_project_view)
 
         def call_facade_method() -> Any:
             try:
@@ -454,23 +777,58 @@ class ExtendedProjectServer(ProjectServer):
                 raise
             except Exception as e:
                 return self._text_response(f"{type(e).__name__}: {e}", 400)
-            return call_facade_method_view()
+            return self._process_using_project(call_request.project_name, call_facade_method_view)
 
         app.view_functions["heartbeat"] = heartbeat
         app.view_functions["query_project"] = query_project
         app.view_functions["call_facade_method"] = call_facade_method
 
+        def read_project_of_body() -> str | None:
+            """
+            :return: the request body's non-empty string ``project``, or None if there is none
+            """
+            project = (request.get_json(silent=True) or {}).get("project")
+            return project if isinstance(project, str) and project else None
+
         @app.route("/warmup", methods=["POST"])
         def warmup() -> Any:
-            body = request.get_json(silent=True) or {}
-            project = body.get("project")
-            if not isinstance(project, str) or not project:
+            project = read_project_of_body()
+            if project is None:
                 return self._text_response('Expected a JSON body {"project": <name or root path>}', 400)
+            project_root_or_name: str = project
+
+            def start_warm_up() -> Response:
+                try:
+                    self.warm_up(project_root_or_name)
+                except ValueError as e:
+                    return self._text_response(str(e), 404)
+                return self._json_response({"projects": self._readiness.snapshot()}, 202)
+
+            return self._process_using_project(project_root_or_name, start_warm_up)
+
+        @app.route("/register", methods=["POST"])
+        def register() -> Any:
+            project = read_project_of_body()
+            if project is None:
+                return self._text_response('Expected a JSON body {"project": <root path>}', 400)
             try:
-                self.warm_up(project)
-            except ValueError as e:
-                return self._text_response(str(e), 404)
-            return Response(json.dumps({"projects": self._readiness.snapshot()}), status=202, mimetype="application/json")
+                registered_project, added = self.register_project(project)
+            except ProjectRequestRejectedError as e:
+                return self._text_response(str(e), e.status)
+            return self._json_response({"project": self._project_json_dict(registered_project), "added": added}, 200)
+
+        @app.route("/unload", methods=["POST"])
+        def unload() -> Any:
+            project = read_project_of_body()
+            forget = (request.get_json(silent=True) or {}).get("forget", False)
+            if project is None or not isinstance(forget, bool):
+                return self._text_response('Expected a JSON body {"project": <name or root path>, "forget": <bool>}', 400)
+            try:
+                registered_project, was_loaded = self.unload_project(project, forget=forget)
+            except ProjectRequestRejectedError as e:
+                return self._text_response(str(e), e.status)
+            content = {"project": self._project_json_dict(registered_project), "unloaded": was_loaded, "forgotten": forget}
+            return self._json_response(content, 200)
 
         @app.route("/shutdown", methods=["POST"])
         def shutdown() -> Any:

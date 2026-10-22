@@ -559,14 +559,22 @@ class TopLevelCommands(AutoRegisteringGroup):
         "If not given, the server accepts what upstream Serena does: all read-only tools via /query_project and all "
         "facade methods, including edits, via /call_facade_method.",
     )
+    @click.option(
+        "--writable-root",
+        "writable_roots",
+        multiple=True,
+        help="Directory within which projects (e.g. git worktrees) can be registered at runtime; repeatable. "
+        "Requires --allowed-tool and a local --host.",
+    )
     def start_project_server(
         host: str,
         port: int | None,
         log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None,
         warm_projects: tuple[str, ...],
         allowed_tools: tuple[str, ...],
+        writable_roots: tuple[str, ...],
     ) -> None:
-        from serena.project_server_ext import ExtendedProjectServer
+        from serena.project_server_ext import ExtendedProjectServer, ProjectServerSettingsError
 
         # initialize logging
         Logger.root.setLevel(logging.INFO)
@@ -585,7 +593,12 @@ class TopLevelCommands(AutoRegisteringGroup):
         log.info("Starting Serena project server")
         log.info("Storing logs in %s", log_path)
 
-        server = ExtendedProjectServer(host=host, port=port, warm_projects=warm_projects, allowed_tools=allowed_tools)
+        try:
+            server = ExtendedProjectServer(
+                host=host, port=port, warm_projects=warm_projects, allowed_tools=allowed_tools, writable_roots=writable_roots
+            )
+        except ProjectServerSettingsError as e:
+            raise click.UsageError(str(e)) from e
         server.run()
 
     @staticmethod
