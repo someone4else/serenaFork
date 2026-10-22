@@ -3,6 +3,7 @@ graceful shutdown), exercised through the HTTP routes of a server whose agent is
 """
 
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -17,9 +18,11 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
+from click.testing import CliRunner
 from flask import Flask
 
-from serena.config.serena_config import SerenaConfig
+from serena.cli import TopLevelCommands
+from serena.config.serena_config import RegisteredProject, SerenaConfig, SerenaPaths
 from serena.constants import SERENA_MANAGED_DIR_NAME
 from serena.edited_file_writer import WritableRoots
 from serena.project_server import ProjectServer
@@ -399,6 +402,41 @@ class TestSettings:
         with pytest.raises(ProjectServerSettingsError, match="local host"):
             ExtendedProjectServer(host="0.0.0.0", allowed_tools=("find_symbol",), writable_roots=("/worktrees",))
 
+    @pytest.mark.parametrize(
+        ("args", "reason"),
+        [
+            pytest.param(["--writable-root", "/worktrees"], "allowed-tool", id="without_allowlist"),
+            pytest.param(
+                ["--host", "0.0.0.0", "--allowed-tool", "find_symbol", "--writable-root", "/worktrees"], "local host", id="remote_host"
+            ),
+        ],
+    )
+    def test_command_refuses_inadmissible_settings_before_starting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str], reason: str
+    ) -> None:
+        monkeypatch.setattr(SerenaPaths(), "get_next_log_file_path", lambda prefix: str(tmp_path / "server.log"))
+        monkeypatch.setattr(ExtendedProjectServer, "run", lambda self: pytest.fail("the server must not run"))
+        root_logger = logging.getLogger()
+        handlers_before, level_before = list(root_logger.handlers), root_logger.level
+        try:
+            result = CliRunner().invoke(TopLevelCommands.start_project_server, args)
+        finally:
+            for handler in root_logger.handlers[len(handlers_before) :]:
+                root_logger.removeHandler(handler)
+                handler.close()
+            root_logger.setLevel(level_before)
+
+        assert result.exit_code == 2
+        assert reason in result.output
+
+    def test_registry_file_of_the_standard_port_is_not_shared_with_an_overridden_default_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ProjectServer, "PORT", 24226)
+
+        assert Path(ProjectServerRegistryFile.path_for(24226)).name == "project-server-24226.json"
+        assert Path(ProjectServerRegistryFile.path_for(24225)).name == "project-server.json"
+
     def test_writable_roots_contain_paths_strictly_inside_them(self, tmp_path: Path) -> None:
         roots = WritableRoots([str(tmp_path / "worktrees")])
 
@@ -544,6 +582,118 @@ class TestRegistrationAndUnloading:
         assert self._post(server, "/unload", {"project": "warming"}).status_code == 409
         assert self._post(server, "/unload", {"project": "unknown"}).status_code == 404
 
+    def test_project_outside_the_writable_roots_is_not_unloaded(self, server: ExtendedProjectServer, tmp_path: Path) -> None:
+        main = tmp_path / "main"
+        (main / SERENA_MANAGED_DIR_NAME).mkdir(parents=True)
+        (main / SERENA_MANAGED_DIR_NAME / "project.yml").write_text('project_name: "main"\nlanguage_servers: []\n', encoding="utf-8")
+        serena_config = server.get_serena_config()
+        serena_config.add_registered_project(RegisteredProject.from_project_root(main, serena_config=serena_config))
+        project = self._load(server, main)
+
+        response = self._post(server, "/unload", {"project": "main", "forget": True})
+
+        assert response.status_code == 403
+        project.shutdown.assert_not_called()
+        assert self._registered_roots_in_file() == [main.resolve()]
+
+    def test_project_whose_root_was_removed_is_unloaded_by_its_root(self, server: ExtendedProjectServer) -> None:
+        project_dir = self._make_project("removed")
+        self._post(server, "/register", {"project": str(project_dir)})
+        project = self._load(server, project_dir)
+        shutil.rmtree(project_dir)
+
+        response = self._post(server, "/unload", {"project": str(project_dir), "forget": True})
+
+        assert response.status_code == 200
+        project.shutdown.assert_called_once()
+
+    def test_invalid_project_configuration_is_rejected_with_its_reason(self, server: ExtendedProjectServer) -> None:
+        project_dir = self._make_project("invalid")
+        (project_dir / SERENA_MANAGED_DIR_NAME / "project.yml").write_text(
+            'project_name: "invalid"\nlanguage_servers: [no_such_language]\n'
+        )
+
+        response = self._post(server, "/register", {"project": str(project_dir)})
+
+        assert response.status_code == 400
+        assert "Invalid project configuration" in response.get_data(as_text=True)
+
+    def test_unloading_gives_up_on_a_project_in_use_and_admits_requests_again(
+        self, server: ExtendedProjectServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project_dir = self._make_project("busy")
+        self._post(server, "/register", {"project": str(project_dir)})
+        project = self._load(server, project_dir)
+        monkeypatch.setattr(ExtendedProjectServer, "UNLOAD_WAIT_SECONDS", 0.2)
+        entered, release = threading.Event(), threading.Event()
+
+        def query(req: Any) -> str:
+            if not entered.is_set():
+                entered.set()
+                release.wait(timeout=10)
+            return "queried"
+
+        monkeypatch.setattr(server, "_query_project", query)
+        body = {"project_name": "busy", "tool_name": "find_symbol", "tool_params_json": "{}"}
+        running_query = threading.Thread(target=lambda: self._post(server, "/query_project", body))
+        running_query.start()
+        try:
+            assert entered.wait(timeout=5)
+            response = self._post(server, "/unload", {"project": "busy"})
+            assert response.status_code == 409
+            assert "still in use" in response.get_data(as_text=True)
+            assert self._post(server, "/query_project", body).get_data(as_text=True) == "queried"
+        finally:
+            release.set()
+            running_query.join(timeout=5)
+        project.shutdown.assert_not_called()
+        assert self._post(server, "/unload", {"project": "busy"}).status_code == 200
+
+    @pytest.mark.parametrize("route", ["/query_project", "/call_facade_method", "/warmup", "/edit_project", "/unload"])
+    def test_requests_for_a_project_being_unloaded_are_rejected(self, server: ExtendedProjectServer, route: str) -> None:
+        project_dir = self._make_project("unloading")
+        self._post(server, "/register", {"project": str(project_dir)})
+        _mocked_agent(server).get_repl().entrypoint.get_facade_.return_value.get_method.return_value = SimpleNamespace(
+            info=FacadeMethodInfo(name="find_symbol", corresponding_tool=FindSymbolTool), qualified_name="lsp.find_symbol"
+        )
+        bodies = {
+            "/query_project": {"project_name": "unloading", "tool_name": "find_symbol", "tool_params_json": "{}"},
+            "/call_facade_method": {
+                "project_name": "unloading",
+                "facade_name": "lsp",
+                "method_name": "find_symbol",
+                "args": [],
+                "kwargs": {},
+            },
+            "/warmup": {"project": "unloading"},
+            "/edit_project": {"project_name": "unloading", "tool_name": "replace_symbol_body", "tool_params_json": "{}"},
+            "/unload": {"project": "unloading"},
+        }
+
+        with server._usage.unloading(str(project_dir.resolve()), timeout=1):
+            response = self._post(server, route, bodies[route])
+
+        assert response.status_code == 409
+        assert "being unloaded" in response.get_data(as_text=True)
+
+    def test_failing_request_does_not_delay_the_unloading(self, server: ExtendedProjectServer, monkeypatch: pytest.MonkeyPatch) -> None:
+        project_dir = self._make_project("failing")
+        self._post(server, "/register", {"project": str(project_dir)})
+        self._load(server, project_dir)
+
+        def fail(req: Any) -> str:
+            raise RuntimeError("query failed")
+
+        monkeypatch.setattr(server, "_query_project", fail)
+        with server._app.test_client() as client:
+            client.post(
+                "/query_project", json={"project_name": "failing", "tool_name": "find_symbol", "tool_params_json": "{}"}, headers=AUTH
+            )
+        start = time.monotonic()
+
+        assert self._post(server, "/unload", {"project": "failing"}).status_code == 200
+        assert time.monotonic() - start < 2
+
     def test_unloading_waits_for_requests_using_the_project_and_rejects_new_ones(
         self, server: ExtendedProjectServer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -668,6 +818,22 @@ class TestEditRoute:
         with server._app.test_client() as client:
             assert client.post("/edit_project", json={"project_name": "wt1"}, headers=AUTH).status_code == 400
         assert self._edit(server, "wt1", params="{not json").status_code == 400
+        assert self._edit(server, "wt1", params='["not", "an", "object"]').status_code == 400
+        self.tool.apply_ex.assert_not_called()
+
+    def test_project_that_cannot_be_loaded_is_reported_as_plain_text(
+        self, server: ExtendedProjectServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(project_root_or_name: str) -> Any:
+            raise RuntimeError("language server not installed")
+
+        monkeypatch.setattr(server, "_get_project", fail)
+
+        response = self._edit(server, "wt1")
+
+        assert response.status_code == 500
+        assert response.mimetype == "text/plain"
+        assert "language server not installed" in response.get_data(as_text=True)
 
     def test_failing_tool_is_reported_with_status_422(self, server: ExtendedProjectServer) -> None:
         self.tool.apply_ex.side_effect = ToolCallError("No symbol with name A found")
@@ -678,8 +844,13 @@ class TestEditRoute:
         assert "No symbol with name A found" in response.get_data(as_text=True)
 
     def test_timed_out_edit_is_reported_as_of_unknown_outcome(self, server: ExtendedProjectServer) -> None:
-        _mocked_agent(server).serena_config.tool_timeout = 0
-        self.tool.apply_ex.side_effect = ToolCallError("Tool execution timed out after 0 seconds.")
+        _mocked_agent(server).serena_config.tool_timeout = 0.05
+
+        def time_out(**kwargs: Any) -> str:
+            time.sleep(0.1)
+            raise ToolCallError("Tool execution timed out after 0.05 seconds.")
+
+        self.tool.apply_ex.side_effect = time_out
 
         response = self._edit(server, "wt1")
 

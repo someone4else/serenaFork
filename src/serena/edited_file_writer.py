@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 class WritableRoots:
     """
-    Directories within which files and projects may be written (e.g. ``--writable-root`` of the project server).
+    Directories within which files and projects may be written.
     """
 
     def __init__(self, roots: Sequence[str] = ()) -> None:
@@ -58,7 +58,7 @@ class WriteOutsideWritableRootsError(PermissionError):
 class WriteConfinement:
     """
     The process-wide confinement of the writes of edited files (by :class:`EditedFileWriter` and file renames) to
-    writable roots. A process is unconfined unless confined explicitly (as by the project server with writable roots).
+    writable roots. A process is unconfined unless confined explicitly.
     """
 
     _writable_roots: WritableRoots | None = None

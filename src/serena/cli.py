@@ -994,15 +994,13 @@ class ProjectCommands(AutoRegisteringGroup):
     @click.option("--json", "as_json", is_flag=True, help="Print the outcome as JSON.")
     def prepare_worktree(worktree: str, main_root: str, name: str | None, no_warm: bool, as_json: bool) -> None:
         # the worktree projects of the Serena fork
-        from serena.worktree_projects import ProjectServerAdminClient, ProjectServerState, WorktreeProjectError, WorktreeProjects
+        from serena.worktree_projects import ProjectServerState, WorktreeProjectError, WorktreeProjects
 
-        serena_config = SerenaConfig.from_config_file()
-        worktree_projects = WorktreeProjects(serena_config, ProjectServerAdminClient.find_running(serena_config))
         try:
-            report = worktree_projects.prepare(worktree, main_root, name=name, warm_up=not no_warm)
+            report = WorktreeProjects.from_config_file().prepare(worktree, main_root, name=name, warm_up=not no_warm)
         except WorktreeProjectError as e:
             raise click.ClickException(str(e)) from e
-        click.echo(json.dumps(report.to_json_dict()) if as_json else report.describe())
+        click.echo(report.render(as_json))
         if report.project_server != ProjectServerState.ANNOUNCED:
             sys.exit(3)
 
@@ -1019,15 +1017,13 @@ class ProjectCommands(AutoRegisteringGroup):
     @click.option("--json", "as_json", is_flag=True, help="Print the outcome as JSON.")
     def release_worktree(worktree: str, delete_data: bool, timeout: float, as_json: bool) -> None:
         # the worktree projects of the Serena fork
-        from serena.worktree_projects import ProjectServerAdminClient, WorktreeProjectError, WorktreeProjects
+        from serena.worktree_projects import WorktreeProjectError, WorktreeProjects
 
-        serena_config = SerenaConfig.from_config_file()
-        worktree_projects = WorktreeProjects(serena_config, ProjectServerAdminClient.find_running(serena_config))
         try:
-            report = worktree_projects.release(worktree, delete_data=delete_data, timeout=timeout)
+            report = WorktreeProjects.from_config_file().release(worktree, delete_data=delete_data, timeout=timeout)
         except WorktreeProjectError as e:
             raise click.ClickException(str(e)) from e
-        click.echo(json.dumps(report.to_json_dict()) if as_json else report.describe())
+        click.echo(report.render(as_json))
 
     @staticmethod
     @click.command(

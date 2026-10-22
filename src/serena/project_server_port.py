@@ -11,7 +11,7 @@ from serena.constants import SerenaPorts
 
 class ProjectServerPort:
     """
-    The default port of the project server, used by the server and by its clients.
+    The default port of the project server.
     """
 
     ENVIRONMENT_VARIABLE = "SERENA_PROJECT_SERVER_PORT"

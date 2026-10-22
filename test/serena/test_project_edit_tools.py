@@ -76,6 +76,18 @@ class TestWorktreeProjectsMode:
         for tool_name in ("list_queryable_projects", "query_project", "edit_project"):
             assert tool_set.includes_name(tool_name)
 
+    def test_in_planning_mode_symbol_edits_of_other_projects_are_refused(self, edit_client: type[_RecordingEditClient]) -> None:
+        modes = [SerenaAgentMode.load(name) for name in ("interactive", "planning", "worktree-projects")]
+        tool_set = ToolSet.default().apply(*modes)
+        agent = MagicMock()
+        agent.get_language_backend.return_value.is_lsp.return_value = True
+        agent.get_active_tools.return_value.contains_tool_name.side_effect = tool_set.includes_name
+
+        assert tool_set.includes_name("edit_project")
+        with pytest.raises(ValueError, match="not active in this session"):
+            EditProjectTool(agent).apply("C:/wt/wt1", "replace_symbol_body", "{}")
+        assert edit_client.edits == []
+
     def test_sessions_without_the_mode_cannot_edit_other_projects(self) -> None:
         assert not ToolSet.default().includes_name("edit_project")
         assert not ToolSet.default().apply(SerenaAgentMode.load("query-projects")).includes_name("edit_project")

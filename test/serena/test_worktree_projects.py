@@ -4,16 +4,20 @@ Tests for the preparation and release of git worktrees as Serena projects (`sere
 """
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
+import psutil
 import pytest
+import requests
 from click.testing import CliRunner
 
 from serena.cli import ProjectCommands
 from serena.config.serena_config import SerenaConfig
 from serena.constants import SERENA_MANAGED_DIR_NAME
+from serena.project_server_ext import ProjectServerRegistryFile
 from serena.project_server_port import ProjectServerPort
 from serena.util.yaml import load_yaml
 from serena.worktree_projects import ProjectServerAdminClient, ProjectServerState, WorktreeProjectError, WorktreeProjects
@@ -29,9 +33,12 @@ ignored_paths:
 
 
 class _RecordingProjectServer(ProjectServerAdminClient):
-    """A stand-in for the project server's admin client, answering each route with the given sequence of statuses."""
+    """
+    A stand-in for the project server's admin client, answering each route with the given sequence of statuses (or
+    raising the given exceptions).
+    """
 
-    def __init__(self, statuses_by_route: dict[str, list[int]]) -> None:  # the base class (an HTTP client) is not initialised
+    def __init__(self, statuses_by_route: dict[str, list[int | Exception]]) -> None:  # the base class (an HTTP client) is not initialised
         self.statuses_by_route = statuses_by_route
         self.requests: list[tuple[str, dict[str, Any]]] = []
 
@@ -39,6 +46,8 @@ class _RecordingProjectServer(ProjectServerAdminClient):
         self.requests.append((route, body))
         statuses = self.statuses_by_route[route]
         status = statuses.pop(0) if len(statuses) > 1 else statuses[0]
+        if isinstance(status, Exception):
+            raise status
         return SimpleNamespace(status_code=status, text=f"answer {status}", json=dict)
 
 
@@ -48,8 +57,9 @@ class TestWorktreeProjects:
         self.config_path = tmp_path / "home" / "serena_config.yml"
         self.config_path.parent.mkdir()
         self.config_path.write_text("projects: []\n", encoding="utf-8")
-        monkeypatch.setenv("SERENA_HOME", str(self.config_path.parent))
         monkeypatch.setattr(SerenaConfig, "_determine_config_file_path", classmethod(lambda cls: str(self.config_path)))
+        # the commands must never reach a project server running on this machine
+        monkeypatch.setattr(ProjectServerAdminClient, "find_running", classmethod(lambda cls, serena_config: None))
 
         self.main = tmp_path / "repo"
         main_data = self.main / SERENA_MANAGED_DIR_NAME
@@ -191,6 +201,89 @@ class TestWorktreeProjects:
             projects.release(str(worktree), timeout=0)
 
         assert self._registered_roots() == [worktree.resolve()]
+
+    def test_unresponsive_project_server_fails_the_release_and_is_reported_by_the_preparation(self) -> None:
+        released = self._make_worktree("released")
+        self._prepare(released)
+        unresponsive = {route: [ConnectionError("no response")] for route in ("/register", "/warmup", "/unload")}
+
+        with pytest.raises(WorktreeProjectError, match="no response"):
+            WorktreeProjects(SerenaConfig.from_config_file(), _RecordingProjectServer(unresponsive)).release(str(released))
+        report = WorktreeProjects(SerenaConfig.from_config_file(), _RecordingProjectServer(unresponsive)).prepare(
+            str(self._make_worktree("prepared")), str(self.main)
+        )
+
+        assert set(self._registered_roots()) == {released.resolve(), (self.worktrees / "prepared").resolve()}
+        assert (report.project_server, report.message) == (ProjectServerState.REJECTED, "no response")
+
+    def test_interrupted_preparation_is_completed_by_the_next_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        worktree = self._make_worktree("interrupted")
+
+        def fail(*args: Any, **kwargs: Any) -> None:
+            raise OSError("disk full")
+
+        with monkeypatch.context() as patch:
+            patch.setattr("serena.worktree_projects.save_yaml", fail)
+            assert self._prepare(worktree).exit_code != 0
+        completed = self._prepare(worktree, "--name", "ews@interrupted")
+
+        assert json.loads(completed.output)["copied"] is True
+        assert load_yaml(str(worktree / SERENA_MANAGED_DIR_NAME / "project.yml"))["project_name"] == "ews@interrupted"
+        assert (worktree / SERENA_MANAGED_DIR_NAME / "cache" / "csharp" / "raw_document_symbols.pkl").read_bytes() == b"raw symbols"
+        assert not list((worktree / SERENA_MANAGED_DIR_NAME).rglob("*.tmp"))
+
+
+class TestFindRunningProjectServer:
+    """
+    Finding the running project server via its registry file in Serena's home directory.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.registry_path = tmp_path / "project-server.json"
+        monkeypatch.setattr(ProjectServerRegistryFile, "path_for", staticmethod(lambda port, directory=None: str(self.registry_path)))
+        self.serena_config = cast(SerenaConfig, SimpleNamespace(auth_secret="secret", tool_timeout=240))
+        self.heartbeats: list[Any] = []
+
+        def heartbeat(url: str, headers: dict[str, str], timeout: float) -> Any:
+            self.heartbeats.append((url, headers))
+            if self.heartbeat_answer is None:
+                raise requests.ConnectionError("refused")
+            return SimpleNamespace(raise_for_status=self.heartbeat_answer)
+
+        monkeypatch.setattr("serena.project_server.requests_lib.get", heartbeat)
+        self.heartbeat_answer: Any = lambda: None
+
+    def _write_registry(self, content: str) -> None:
+        self.registry_path.write_text(content, encoding="utf-8")
+
+    def _raise_unauthorized(self) -> None:
+        raise requests.HTTPError("401 Unauthorized")
+
+    def test_live_server_answering_its_heartbeat_is_found(self) -> None:
+        self._write_registry(json.dumps({"pid": os.getpid(), "port": 24299}))
+
+        client = ProjectServerAdminClient.find_running(self.serena_config)
+
+        assert client is not None
+        assert self.heartbeats == [("http://127.0.0.1:24299/heartbeat", {"Authorization": "Bearer secret"})]
+
+    @pytest.mark.parametrize(
+        "case",
+        ["no_registry", "broken_registry", "dead_process", "no_heartbeat", "unauthorized"],
+    )
+    def test_stale_or_unreachable_server_is_not_found(self, case: str) -> None:
+        dead_pid = max(psutil.pids()) + 100000
+        if case == "broken_registry":
+            self._write_registry("{not json")
+        elif case != "no_registry":
+            self._write_registry(json.dumps({"pid": dead_pid if case == "dead_process" else os.getpid(), "port": 24299}))
+        if case == "no_heartbeat":
+            self.heartbeat_answer = None
+        elif case == "unauthorized":
+            self.heartbeat_answer = self._raise_unauthorized
+
+        assert ProjectServerAdminClient.find_running(self.serena_config) is None
 
 
 class TestProjectServerPort:

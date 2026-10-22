@@ -19,9 +19,9 @@ import psutil
 import requests
 
 from serena.config.serena_config import ProjectConfig, RegisteredProject, SerenaConfig
-from serena.project_server import ProjectServer
-from serena.project_server_ext import ProjectServerRegistryFile
-from serena.util.yaml import load_yaml
+from serena.project_server import ProjectServer, ProjectServerClient
+from serena.project_server_ext import ExtendedProjectServer, ProjectServerRegistryFile
+from serena.util.yaml import load_yaml, save_yaml
 from solidlsp.ls import SolidLanguageServer
 
 log = logging.getLogger(__name__)
@@ -33,20 +33,13 @@ class WorktreeProjectError(Exception):
     """
 
 
-class ProjectServerAdminClient:
+class ProjectServerAdminClient(ProjectServerClient):
     """
     A client for the routes of the running project server that register, warm up and unload projects.
     """
 
-    TIMEOUT_SECONDS = 60.0
-
-    def __init__(self, port: int, auth_secret: str) -> None:
-        """
-        :param port: the server's port (on the local host)
-        :param auth_secret: the shared authentication secret
-        """
-        self._base_url = f"http://127.0.0.1:{port}"
-        self._headers = {"Authorization": f"Bearer {auth_secret}"}
+    TIMEOUT_SECONDS = ExtendedProjectServer.UNLOAD_WAIT_SECONDS + 60.0
+    """the time to wait for a response, exceeding the time for which the server's unloading waits for requests"""
 
     @classmethod
     def find_running(cls, serena_config: SerenaConfig) -> "ProjectServerAdminClient | None":
@@ -63,20 +56,22 @@ class ProjectServerAdminClient:
         pid, port = registry.get("pid"), registry.get("port")
         if not isinstance(pid, int) or not isinstance(port, int) or not psutil.pid_exists(pid):
             return None
-        client = cls(port, serena_config.auth_secret)
         try:
-            response = requests.get(client._base_url + "/heartbeat", headers=client._headers, timeout=5)
-        except requests.RequestException:
+            return cls(serena_config, port=port)
+        except ConnectionError:
             return None
-        return client if response.status_code == 200 else None
 
     def post(self, route: str, body: dict[str, Any]) -> requests.Response:
         """
         :param route: the route, e.g. "/register"
         :param body: the JSON body
         :return: the server's response
+        :raises ConnectionError: if the server does not respond
         """
-        return requests.post(self._base_url + route, json=body, headers=self._headers, timeout=self.TIMEOUT_SECONDS)
+        try:
+            return requests.post(self._base_url + route, json=body, headers=self._headers, timeout=self.TIMEOUT_SECONDS)
+        except requests.RequestException as e:
+            raise ConnectionError(f"The project server did not respond to {route}: {e}") from e
 
 
 class ProjectServerState(str, Enum):
@@ -112,10 +107,13 @@ class WorktreeProjectReport:
     def to_json_dict(self) -> dict[str, Any]:
         return {**asdict(self), "project_server": self.project_server.value}
 
-    def describe(self) -> str:
+    def render(self, as_json: bool) -> str:
         """
-        :return: a human-readable description of the outcome
+        :param as_json: whether to render the outcome as JSON (see `to_json_dict`) rather than as text
+        :return: the rendered outcome
         """
+        if as_json:
+            return json.dumps(self.to_json_dict())
         registration = "registered" if self.registered else "not registered"
         description = f"Project '{self.name}' ({self.root}): {registration}, project server: {self.project_server.value}"
         return description if self.message is None else f"{description} ({self.message})"
@@ -136,6 +134,14 @@ class WorktreeProjects:
         """
         self._serena_config = serena_config
         self._project_server = project_server
+
+    @classmethod
+    def from_config_file(cls) -> "WorktreeProjects":
+        """
+        :return: the instance for Serena's configuration file and the running project server (if any)
+        """
+        serena_config = SerenaConfig.from_config_file()
+        return cls(serena_config, ProjectServerAdminClient.find_running(serena_config))
 
     def prepare(self, worktree_root: str, main_root: str, name: str | None = None, warm_up: bool = True) -> WorktreeProjectReport:
         """
@@ -176,14 +182,14 @@ class WorktreeProjects:
             name = f"{main_name}@{worktree.parent.name}-{worktree.name}"
         self._release_name(name, worktree)
 
-        # write the configuration and copy the caches of a new worktree project
+        # copy the caches and write the configuration of a new worktree project; the configuration, whose existence
+        # marks the worktree as prepared, is written last and atomically, such that an interrupted preparation is
+        # completed by the next one
         if not is_prepared:
-            os.makedirs(os.path.dirname(worktree_yml_path), exist_ok=True)
-            shutil.copyfile(main_yml_path, worktree_yml_path)
-            project_config = ProjectConfig.load(worktree, serena_config=self._serena_config)
-            project_config.project_name = name
-            project_config.save(worktree_yml_path, save_project_local_yml=False)
             self._copy_raw_symbol_caches(main, worktree)
+            project_yml = load_yaml(main_yml_path)
+            project_yml["project_name"] = name
+            save_yaml(worktree_yml_path, project_yml)
 
         # register the project
         if self._find_registered_project(worktree) is None:
@@ -202,7 +208,7 @@ class WorktreeProjects:
         :param delete_data: whether to also delete the worktree's Serena data folder (configuration and caches)
         :param timeout: the maximum time in seconds to wait for the project server to unload the project
         :return: the report
-        :raises WorktreeProjectError: if the project server does not unload the project
+        :raises WorktreeProjectError: if the project server does not unload the project or does not respond
         """
         worktree = Path(worktree_root).resolve()
 
@@ -211,7 +217,10 @@ class WorktreeProjects:
         if self._project_server is not None:
             deadline = time.monotonic() + timeout
             while True:
-                response = self._project_server.post("/unload", {"project": str(worktree), "forget": True})
+                try:
+                    response = self._project_server.post("/unload", {"project": str(worktree), "forget": True})
+                except ConnectionError as e:
+                    raise WorktreeProjectError(f"{e}; it may still unload the project, repeat the release") from e
                 if response.status_code != 409 or time.monotonic() >= deadline:
                     break
                 time.sleep(self.UNLOAD_RETRY_INTERVAL_SECONDS)
@@ -283,8 +292,11 @@ class WorktreeProjects:
             # the copy is written under a temporary name first, such that a language server never reads a partial file
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary_target = target.with_name(f"{file_name}.{os.getpid()}.copy.tmp")
-            shutil.copyfile(source, temporary_target)
-            os.replace(temporary_target, target)
+            try:
+                shutil.copyfile(source, temporary_target)
+                os.replace(temporary_target, target)
+            finally:
+                temporary_target.unlink(missing_ok=True)
 
     def _announce(self, worktree: Path, warm_up: bool) -> tuple[ProjectServerState, str | None]:
         """
@@ -294,11 +306,14 @@ class WorktreeProjects:
         """
         if self._project_server is None:
             return ProjectServerState.ABSENT, None
-        response = self._project_server.post("/register", {"project": str(worktree)})
-        if response.status_code != 200:
-            return ProjectServerState.REJECTED, f"{response.status_code}: {response.text}"
-        if warm_up:
-            response = self._project_server.post("/warmup", {"project": str(worktree)})
-            if response.status_code != 202:
+        try:
+            response = self._project_server.post("/register", {"project": str(worktree)})
+            if response.status_code != 200:
                 return ProjectServerState.REJECTED, f"{response.status_code}: {response.text}"
+            if warm_up:
+                response = self._project_server.post("/warmup", {"project": str(worktree)})
+                if response.status_code != 202:
+                    return ProjectServerState.REJECTED, f"{response.status_code}: {response.text}"
+        except ConnectionError as e:
+            return ProjectServerState.REJECTED, str(e)
         return ProjectServerState.ANNOUNCED, None

@@ -29,6 +29,7 @@ from werkzeug.exceptions import HTTPException
 
 from serena import serena_version
 from serena.config.serena_config import RegisteredProject, SerenaConfig, SerenaPaths
+from serena.constants import SerenaPorts
 from serena.edited_file_writer import WritableRoots, WriteConfinement
 from serena.project_server import CallFacadeMethodRequest, ProjectServer, ProjectServerClient, QueryProjectRequest
 from serena.tools.tools_base import ToolCallError
@@ -86,6 +87,15 @@ class ProjectConflictError(ProjectRequestRejectedError):
     """
 
     status = 409
+
+
+class ProjectRequestFailedError(ProjectRequestRejectedError):
+    """
+    Raised when a request concerning a project fails for a reason other than the request (e.g. the project cannot be
+    loaded).
+    """
+
+    status = 500
 
 
 class ToolFailedError(ProjectRequestRejectedError):
@@ -417,7 +427,9 @@ class ProjectServerRegistryFile:
         :param directory: the directory containing the file; None for Serena's home directory
         :return: the path of the registry file of the server with the given port
         """
-        file_name = "project-server.json" if port == ProjectServer.PORT else f"project-server-{port}.json"
+        # the name depends on Serena's standard port rather than on the (overridable) default, such that a server on
+        # another port never replaces the registry file of a server on the standard port
+        file_name = "project-server.json" if port == SerenaPorts.PROJECT_SERVER_PORT else f"project-server-{port}.json"
         return os.path.join(directory if directory is not None else SerenaPaths().serena_user_home_dir, file_name)
 
     def write(self, projects: dict[str, dict[str, Any]]) -> None:
@@ -566,7 +578,10 @@ class ExtendedProjectServer(ProjectServer):
             # the new project's name must identify it unambiguously
             if not os.path.isfile(serena_config.get_project_yml_location(project_root)):
                 raise ProjectNotFoundError(f"No project configuration found in '{project_root}'")
-            new_project = RegisteredProject.from_project_root(project_root, serena_config=serena_config)
+            try:
+                new_project = RegisteredProject.from_project_root(project_root, serena_config=serena_config)
+            except Exception as e:
+                raise ProjectRequestRejectedError(f"Invalid project configuration in '{project_root}': {type(e).__name__}: {e}") from e
             stale_projects = []
             for registered_project in serena_config.projects:
                 if registered_project.project_name == new_project.project_name:
@@ -577,7 +592,8 @@ class ExtendedProjectServer(ProjectServer):
                         )
                     stale_projects.append(registered_project)
 
-            # the project list is replaced rather than modified, as it is read without locking
+            # removals replace the project list rather than modify it, as it is read without locking (an append, as
+            # by the registration, is safe for readers)
             if stale_projects:
                 serena_config.projects = [p for p in serena_config.projects if all(p is not s for s in stale_projects)]
             serena_config.add_registered_project(new_project)
@@ -590,11 +606,12 @@ class ExtendedProjectServer(ProjectServer):
         the project is released, and its readiness is no longer reported. Requests for the project meanwhile are
         rejected; afterwards, the project is loaded anew when requested (unless it was forgotten).
 
-        :param project_root_or_name: the project's name or root path
+        :param project_root_or_name: the project's name or root path (which may no longer exist)
         :param forget: whether to also remove the project from the server's registered projects (the registration
             in Serena's configuration file is left to the caller)
         :return: the project and whether it was loaded
         :raises ProjectNotFoundError: if the project is not registered
+        :raises ProjectNotAllowedError: if the project is not within the writable roots
         :raises ProjectConflictError: if the project was warmed up at startup, is being warmed up or still in use
         """
         serena_config = self.get_serena_config()
@@ -603,8 +620,14 @@ class ExtendedProjectServer(ProjectServer):
         except ValueError as e:
             raise ProjectRequestRejectedError(str(e)) from e
         if registered_project is None:
+            # the root of a project may have been removed already (e.g. a removed git worktree)
+            normalised_path = os.path.normcase(os.path.abspath(project_root_or_name))
+            registered_project = next((p for p in serena_config.projects if os.path.normcase(str(p.project_root)) == normalised_path), None)
+        if registered_project is None:
             raise ProjectNotFoundError(f"Project '{project_root_or_name}' is not registered with this server")
         project_root = str(registered_project.project_root)
+        if not self._writable_roots.contains(project_root):
+            raise ProjectNotAllowedError(f"Project '{project_root}' is not within a writable root of this server (--writable-root)")
         if project_root in self._pinned_roots:
             raise ProjectConflictError(f"Project '{project_root}' is warmed up at startup (--warm) and is not unloaded")
 
@@ -656,6 +679,8 @@ class ExtendedProjectServer(ProjectServer):
             params = json.loads(edit_request.tool_params_json)
         except ValueError as e:
             raise ProjectRequestRejectedError(str(e)) from e
+        if not isinstance(params, dict):
+            raise ProjectRequestRejectedError("The tool parameters (tool_params_json) must be a JSON object")
         if registered_project is None:
             raise ProjectNotFoundError(f"Project '{edit_request.project_name}' is not registered with this server")
         if not self._writable_roots.contains(str(registered_project.project_root)):
@@ -665,7 +690,10 @@ class ExtendedProjectServer(ProjectServer):
         if registered_project.project_config.read_only:
             raise ProjectNotAllowedError(f"Project '{registered_project.project_root}' is read-only")
 
-        project = self._get_project(edit_request.project_name)
+        try:
+            project = self._get_project(edit_request.project_name)
+        except Exception as e:
+            raise ProjectRequestFailedError(f"Failed to load project '{registered_project.project_root}': {type(e).__name__}: {e}") from e
         with self._active_project_lock, self._agent.active_project_context(project):
             tool = self._agent.get_tool_by_name(edit_request.tool_name)
             start = time.monotonic()

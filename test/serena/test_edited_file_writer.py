@@ -153,6 +153,23 @@ class TestWriteConfinement:
 
         assert (roots / "main" / "File.cs").read_bytes() == b"main\n"
 
+    def test_confined_writes_through_symbolic_links_to_outside_fail(self, roots: Path) -> None:
+        linked_dir = roots / "worktrees" / "wt1" / "linked_dir"
+        linked_file = roots / "worktrees" / "wt1" / "Linked.cs"
+        try:
+            os.symlink(roots / "main", linked_dir, target_is_directory=True)
+            os.symlink(roots / "main" / "File.cs", linked_file)
+        except OSError:
+            pytest.skip("creating symbolic links is not permitted")
+        writer = EditedFileWriter("utf-8", "\n", preserve_line_endings=False)
+
+        for outside in (linked_dir / "File.cs", linked_dir / "New.cs", linked_file):
+            with pytest.raises(WriteOutsideWritableRootsError):
+                writer.write(str(outside), "overwritten\n")
+
+        assert (roots / "main" / "File.cs").read_bytes() == b"main\n"
+        assert not (roots / "main" / "New.cs").exists()
+
     def test_confined_file_rename_to_outside_fails(self, roots: Path) -> None:
         (roots / "worktrees" / "wt1" / "Old.cs").write_bytes(b"old\n")
         editor = SimpleNamespace(project_root=str(roots / "worktrees" / "wt1"), _relative_path_from_uri=lambda uri: uri)
