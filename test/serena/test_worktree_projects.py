@@ -112,34 +112,34 @@ class TestWorktreeProjects:
 
     def test_repeated_preparation_keeps_the_prepared_worktree(self) -> None:
         worktree = self._make_worktree("feature-1")
-        self._prepare(worktree, "--name", "ews@feature-1")
+        self._prepare(worktree, "--name", "repo@feature-1")
         cache = worktree / SERENA_MANAGED_DIR_NAME / "cache" / "csharp" / "raw_document_symbols.pkl"
         cache.write_bytes(b"symbols updated in the worktree")
 
         repeated = self._prepare(worktree)
         renamed = self._prepare(worktree, "--name", "other")
 
-        assert json.loads(repeated.output)["name"] == "ews@feature-1"
+        assert json.loads(repeated.output)["name"] == "repo@feature-1"
         assert json.loads(repeated.output)["copied"] is False
         assert cache.read_bytes() == b"symbols updated in the worktree"
         assert renamed.exit_code == 1
-        assert "already prepared as project 'ews@feature-1'" in renamed.output
+        assert "already prepared as project 'repo@feature-1'" in renamed.output
         assert self._registered_roots() == [worktree.resolve()]
 
     def test_name_of_an_existing_project_conflicts_but_one_of_a_removed_worktree_is_reused(self) -> None:
         first = self._make_worktree("wave1")
         second = self._make_worktree("wave2")
-        self._prepare(first, "--name", "ews@integration")
+        self._prepare(first, "--name", "repo@integration")
 
-        conflict = self._prepare(second, "--name", "ews@integration")
+        conflict = self._prepare(second, "--name", "repo@integration")
         for path in sorted(first.rglob("*"), reverse=True):
             path.unlink() if path.is_file() else path.rmdir()
         first.rmdir()
-        reuse = self._prepare(second, "--name", "ews@integration")
+        reuse = self._prepare(second, "--name", "repo@integration")
 
         assert conflict.exit_code == 1
         assert "already used" in conflict.output
-        assert json.loads(reuse.output)["name"] == "ews@integration"
+        assert json.loads(reuse.output)["name"] == "repo@integration"
         assert self._registered_roots() == [second.resolve()]
 
     def test_release_unregisters_the_project_and_optionally_deletes_its_data(self) -> None:
@@ -225,10 +225,10 @@ class TestWorktreeProjects:
         with monkeypatch.context() as patch:
             patch.setattr("serena.worktree_projects.save_yaml", fail)
             assert self._prepare(worktree).exit_code != 0
-        completed = self._prepare(worktree, "--name", "ews@interrupted")
+        completed = self._prepare(worktree, "--name", "repo@interrupted")
 
         assert json.loads(completed.output)["copied"] is True
-        assert load_yaml(str(worktree / SERENA_MANAGED_DIR_NAME / "project.yml"))["project_name"] == "ews@interrupted"
+        assert load_yaml(str(worktree / SERENA_MANAGED_DIR_NAME / "project.yml"))["project_name"] == "repo@interrupted"
         assert (worktree / SERENA_MANAGED_DIR_NAME / "cache" / "csharp" / "raw_document_symbols.pkl").read_bytes() == b"raw symbols"
         assert not list((worktree / SERENA_MANAGED_DIR_NAME).rglob("*.tmp"))
 

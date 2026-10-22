@@ -24,7 +24,8 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('start', 'stop', 'status', 'install', 'uninstall')]
     [string]$Action,
-    [string]$SerenaExe = 'C:\github\serenaFork\.venv\Scripts\serena.exe',
+    # by default, Serena of the virtual environment of the repository containing this script
+    [string]$SerenaExe = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\.venv\Scripts\serena.exe')),
     [int]$Port = 24225,
     # names or root paths of projects to warm up at startup (Serena versions supporting --warm only)
     [string[]]$Warm = @(),

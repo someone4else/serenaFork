@@ -521,8 +521,8 @@ class TestRegistrationAndUnloading:
         assert self._registered_roots_in_file() == []
 
     def test_name_of_an_existing_project_conflicts_but_one_of_a_removed_root_is_replaced(self, server: ExtendedProjectServer) -> None:
-        first = self._make_project("wave1", project_name="ews@integration")
-        second = self._make_project("wave2", project_name="ews@integration")
+        first = self._make_project("wave1", project_name="repo@integration")
+        second = self._make_project("wave2", project_name="repo@integration")
         assert self._post(server, "/register", {"project": str(first)}).status_code == 200
 
         conflict = self._post(server, "/register", {"project": str(second)})
@@ -530,10 +530,10 @@ class TestRegistrationAndUnloading:
         replacement = self._post(server, "/register", {"project": str(second)})
 
         assert conflict.status_code == 409
-        assert "ews@integration" in conflict.get_data(as_text=True)
+        assert "repo@integration" in conflict.get_data(as_text=True)
         assert replacement.status_code == 200
         assert self._registered_roots_in_file() == [second.resolve()]
-        registered = server.get_serena_config().get_registered_project("ews@integration")
+        registered = server.get_serena_config().get_registered_project("repo@integration")
         assert registered is not None
         assert registered.project_root == second.resolve()
 
