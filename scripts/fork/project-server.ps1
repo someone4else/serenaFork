@@ -18,7 +18,7 @@
     passed on a command line, logged or printed.
 
 .EXAMPLE
-    .\project-server.ps1 -Action install -Warm C:\repo\a,C:\repo\b -AllowedTool find_symbol,get_symbols_overview
+    .\project-server.ps1 -Action install -Warm C:\repo\a,C:\repo\b -AllowedTool find_symbol,get_symbols_overview -WritableRoot C:\repo-worktrees
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -30,6 +30,9 @@ param(
     [string[]]$Warm = @(),
     # tools the server shall accept (Serena versions supporting --allowed-tool only)
     [string[]]$AllowedTool = @(),
+    # directories within which projects (e.g. git worktrees) can be registered at runtime (requires -AllowedTool;
+    # Serena versions supporting --writable-root only)
+    [string[]]$WritableRoot = @(),
     [switch]$IncludeOrphans,
     [string]$TaskName = 'SerenaProjectServer',
     [int]$StartTimeoutSeconds = 120,
@@ -147,6 +150,7 @@ function Get-ServerArguments {
     $arguments = @('start-project-server', '--port', [string]$Port)
     foreach ($project in (Split-ListArgument $Warm)) { $arguments += @('--warm', $project) }
     foreach ($tool in (Split-ListArgument $AllowedTool)) { $arguments += @('--allowed-tool', $tool) }
+    foreach ($root in (Split-ListArgument $WritableRoot)) { $arguments += @('--writable-root', $root) }
     return , $arguments
 }
 
@@ -278,6 +282,8 @@ function Invoke-Install {
     if ($warmList.Count) { $taskArguments += @('-Warm', (Quote-Argument ($warmList -join ','))) }
     $toolList = Split-ListArgument $AllowedTool
     if ($toolList.Count) { $taskArguments += @('-AllowedTool', (Quote-Argument ($toolList -join ','))) }
+    $rootList = Split-ListArgument $WritableRoot
+    if ($rootList.Count) { $taskArguments += @('-WritableRoot', (Quote-Argument ($rootList -join ','))) }
 
     $taskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($taskArguments -join ' ')
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user

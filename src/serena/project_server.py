@@ -13,8 +13,8 @@ from pydantic import BaseModel
 from sensai.util.logging import LogTime
 
 from serena.config.serena_config import SerenaConfig
-from serena.constants import SerenaPorts
 from serena.language_backend import BuiltinLanguageBackend
+from serena.project_server_port import ProjectServerPort
 
 if TYPE_CHECKING:
     from serena.project import Project
@@ -61,7 +61,7 @@ class ProjectServer:
     :class:`~serena.tools.query_project_tools.QueryProjectTool`.
     """
 
-    PORT = SerenaPorts.PROJECT_SERVER_PORT
+    PORT = ProjectServerPort.default()
 
     def __init__(self, host: str = "127.0.0.1", port: int | None = None) -> None:
         """

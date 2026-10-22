@@ -979,6 +979,58 @@ class ProjectCommands(AutoRegisteringGroup):
 
     @staticmethod
     @click.command(
+        "prepare-worktree",
+        help="Prepare a git worktree as a Serena project based on the project of the repository's main directory "
+        "(configuration and symbol caches), register it, and announce it to the running project server. "
+        "Exits with code 3 if no project server can serve the project.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("worktree", type=click.Path(exists=True, file_okay=False))
+    @click.option(
+        "--from", "main_root", type=click.Path(exists=True, file_okay=False), required=True, help="Root of the main directory's project."
+    )
+    @click.option("--name", type=str, default=None, help="Project name; defaults to the name of the main project and the worktree's path.")
+    @click.option("--no-warm", is_flag=True, help="Do not let the project server warm up the project.")
+    @click.option("--json", "as_json", is_flag=True, help="Print the outcome as JSON.")
+    def prepare_worktree(worktree: str, main_root: str, name: str | None, no_warm: bool, as_json: bool) -> None:
+        # the worktree projects of the Serena fork
+        from serena.worktree_projects import ProjectServerAdminClient, ProjectServerState, WorktreeProjectError, WorktreeProjects
+
+        serena_config = SerenaConfig.from_config_file()
+        worktree_projects = WorktreeProjects(serena_config, ProjectServerAdminClient.find_running(serena_config))
+        try:
+            report = worktree_projects.prepare(worktree, main_root, name=name, warm_up=not no_warm)
+        except WorktreeProjectError as e:
+            raise click.ClickException(str(e)) from e
+        click.echo(json.dumps(report.to_json_dict()) if as_json else report.describe())
+        if report.project_server != ProjectServerState.ANNOUNCED:
+            sys.exit(3)
+
+    @staticmethod
+    @click.command(
+        "release-worktree",
+        help="Release a worktree project prepared with prepare-worktree: the running project server unloads it, "
+        "and it is removed from Serena's project registry.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("worktree", type=click.Path(file_okay=False))
+    @click.option("--delete-data", is_flag=True, help="Also delete the worktree's Serena data folder (configuration and caches).")
+    @click.option("--timeout", type=float, default=300.0, show_default=True, help="Time in seconds to wait for the unloading.")
+    @click.option("--json", "as_json", is_flag=True, help="Print the outcome as JSON.")
+    def release_worktree(worktree: str, delete_data: bool, timeout: float, as_json: bool) -> None:
+        # the worktree projects of the Serena fork
+        from serena.worktree_projects import ProjectServerAdminClient, WorktreeProjectError, WorktreeProjects
+
+        serena_config = SerenaConfig.from_config_file()
+        worktree_projects = WorktreeProjects(serena_config, ProjectServerAdminClient.find_running(serena_config))
+        try:
+            report = worktree_projects.release(worktree, delete_data=delete_data, timeout=timeout)
+        except WorktreeProjectError as e:
+            raise click.ClickException(str(e)) from e
+        click.echo(json.dumps(report.to_json_dict()) if as_json else report.describe())
+
+    @staticmethod
+    @click.command(
         "is_ignored_path",
         help="Check if a path is ignored by the project configuration.",
         context_settings={"max_content_width": _MAX_CONTENT_WIDTH},

@@ -421,11 +421,20 @@ class ProjectServerRegistryFile:
         :param pid: the server's process ID
         :param directory: the directory containing the file; None for Serena's home directory
         """
-        file_name = "project-server.json" if port == ProjectServer.PORT else f"project-server-{port}.json"
-        self.path = os.path.join(directory if directory is not None else SerenaPaths().serena_user_home_dir, file_name)
+        self.path = self.path_for(port, directory)
         self._port = port
         self._pid = pid
         self._started_at = datetime.now(UTC).isoformat(timespec="seconds")
+
+    @staticmethod
+    def path_for(port: int, directory: str | None = None) -> str:
+        """
+        :param port: a server's port
+        :param directory: the directory containing the file; None for Serena's home directory
+        :return: the path of the registry file of the server with the given port
+        """
+        file_name = "project-server.json" if port == ProjectServer.PORT else f"project-server-{port}.json"
+        return os.path.join(directory if directory is not None else SerenaPaths().serena_user_home_dir, file_name)
 
     def write(self, projects: dict[str, dict[str, Any]]) -> None:
         """
