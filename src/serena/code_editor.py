@@ -15,20 +15,24 @@ from solidlsp import SolidLanguageServer, ls_types
 from solidlsp.ls import LSPFileBuffer
 from solidlsp.ls_utils import PathUtils, TextStepper, TextUtils
 
+from .edited_file_writer import EditedFileWriter
 from .project import Project
 from .util.file_proxy import FileProxy
-from .util.file_system import write_file_atomic
 
 log = logging.getLogger(__name__)
 TSymbol = TypeVar("TSymbol", bound=Symbol)
 
 
 class CodeEditor(Generic[TSymbol], ABC):
+    preserve_line_endings: bool = False
+    """whether the edit of an existing file keeps the file's own line endings (see `SerenaConfig.preserve_line_endings`)"""
+
     def __init__(self, project: Project) -> None:
         self.project = project
         self.project_root = project.project_root
         self.encoding = project.project_config.encoding
         self.newline = project.line_ending.newline_str
+        self.preserve_line_endings = project.serena_config.preserve_line_endings
 
     class EditedFile(ABC):
         def __init__(self, relative_path: str) -> None:
@@ -94,7 +98,7 @@ class CodeEditor(Generic[TSymbol], ABC):
     def _save_edited_file(self, edited_file: "CodeEditor.EditedFile") -> None:
         abs_path = os.path.join(self.project_root, edited_file.relative_path)
         new_contents = edited_file.get_contents()
-        write_file_atomic(abs_path, new_contents, encoding=self.encoding, newline=self.newline)
+        EditedFileWriter(self.encoding, self.newline, self.preserve_line_endings).write(abs_path, new_contents)
 
     @abstractmethod
     def _find_unique_symbol(self, name_path: str, relative_file_path: str) -> TSymbol:

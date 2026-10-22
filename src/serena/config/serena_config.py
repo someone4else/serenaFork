@@ -966,6 +966,11 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     the language backend to use for code understanding features
     """
     line_ending: LineEnding = LineEnding.NATIVE
+    preserve_line_endings: bool = False
+    """
+    whether the edit of an existing file keeps the file's own line endings, the line ending convention (`line_ending`)
+    then applying only to new files and to files without line breaks
+    """
     symbol_info_budget: float = 10.0
     """
     Time budget (seconds) for requests when tools request include_info (currently

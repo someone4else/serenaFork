@@ -27,6 +27,11 @@ agent_interface: REPL
 # This setting can be overridden on a per-project basis in project.yml files.
 line_ending: native
 
+# whether the edit of an existing file keeps the file's own line endings (CRLF or LF, whichever prevails in the file).
+# If enabled, the line ending convention (see above) applies only to new files and to files without line breaks;
+# if disabled, edited files are rewritten with the line ending convention.
+preserve_line_endings: false
+
 # whether to open a graphical window with Serena's logs.
 # This is mainly supported on Windows and (partly) on Linux; not available on macOS.
 # If you prefer a browser-based tool, use the `web_dashboard` option instead.

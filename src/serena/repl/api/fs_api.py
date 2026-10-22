@@ -8,6 +8,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from serena.edited_file_writer import EditedFileWriter
 from serena.tools import CreateTextFileTool, FindFileTool, ListDirTool, ReadFileTool, SearchForPatternTool
 from serena.util.text_utils import MatchedConsecutiveLines
 from solidlsp.ls_utils import TextUtils
@@ -218,7 +219,7 @@ class FsApi(FacadeApi):
 
         # write the file
         abs_path.parent.mkdir(parents=True, exist_ok=True)
-        abs_path.write_text(content, encoding=project.project_config.encoding, newline=project.line_ending.newline_str)
+        EditedFileWriter.for_project(project).write(str(abs_path), content)
         answer = f"File created: {relative_path}."
         if will_overwrite_existing:
             answer += " Overwrote existing file."
