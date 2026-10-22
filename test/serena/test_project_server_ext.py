@@ -25,7 +25,7 @@ from serena.cli import TopLevelCommands
 from serena.config.serena_config import RegisteredProject, SerenaConfig, SerenaPaths
 from serena.constants import SERENA_MANAGED_DIR_NAME
 from serena.edited_file_writer import WritableRoots
-from serena.project_server import ProjectServer
+from serena.project_server import ProjectServer, ProjectServerClient
 from serena.project_server_ext import (
     ExtendedProjectServer,
     ProjectEditClient,
@@ -861,6 +861,19 @@ class TestEditRoute:
         server._writable_roots = WritableRoots()
 
         assert self._edit(server, "wt1").status_code == 403
+
+
+class TestProjectServerClientHeartbeat:
+    def test_server_answering_its_heartbeat_slowly_under_load_is_reached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # a server busy warming up a project under load can answer the heartbeat only after several seconds
+        def heartbeat_answered_after_8_seconds(url: str, headers: Any, timeout: float) -> Any:
+            if timeout < 8:
+                raise requests.ReadTimeout(f"Read timed out. (read timeout={timeout})")
+            return SimpleNamespace(raise_for_status=lambda: None)
+
+        monkeypatch.setattr("serena.project_server.requests_lib.get", heartbeat_answered_after_8_seconds)
+
+        ProjectServerClient(cast(SerenaConfig, SimpleNamespace(tool_timeout=240, auth_secret=SECRET)), port=24299)
 
 
 class TestProjectEditClient:

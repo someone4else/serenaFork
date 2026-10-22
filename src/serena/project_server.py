@@ -212,6 +212,12 @@ class ProjectServerClient:
     :class:`ConnectionError` is raised.
     """
 
+    HEARTBEAT_TIMEOUT_SECONDS = 30.0
+    """
+    the time to wait for the heartbeat response; a server that warms up projects under load can take several seconds
+    to respond (whereas a server that is not running is detected right away, as the connection is refused)
+    """
+
     def __init__(self, serena_config: SerenaConfig, host: str = "127.0.0.1", port: int | None = None) -> None:
         """
         :param host: the host address of the project server.
@@ -228,7 +234,7 @@ class ProjectServerClient:
 
         # verify that the server is running
         try:
-            response = requests_lib.get(f"{self._base_url}/heartbeat", headers=self._headers, timeout=5)
+            response = requests_lib.get(f"{self._base_url}/heartbeat", headers=self._headers, timeout=self.HEARTBEAT_TIMEOUT_SECONDS)
             response.raise_for_status()
         except requests_lib.ConnectionError:
             raise ConnectionError(f"ProjectServer is not reachable at {self._base_url}. Make sure the server is running.")
