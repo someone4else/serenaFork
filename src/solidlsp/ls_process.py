@@ -232,8 +232,8 @@ class LanguageServerInterface(ABC):
         """
         Terminates communication with the language server, freeing resources
 
-        :param timeout: the maximum time, in seconds, to wait for the language server to terminate before forcefully killing it
-            (if applicable)
+        :param timeout: the maximum time, in seconds, to wait for the language server to shut down gracefully and to
+            terminate before forcefully killing it (if applicable)
         """
         if not self.is_running():
             log.debug("Server process not running, skipping shutdown.")
@@ -248,29 +248,37 @@ class LanguageServerInterface(ABC):
     def _stop(self, timeout: float) -> None:
         pass
 
-    def _send_shutdown(self) -> None:
+    def _send_shutdown(self, timeout: float) -> None:
         """
-        Signals shutdown to the server
-        """
-        log.info("Sending shutdown request to server")
-        self.send.shutdown()
-        log.info("Received shutdown response from server")
-        log.info("Sending exit notification to server")
-        self.notify.exit()
-        log.info("Sent exit notification to server")
+        Signals shutdown to the server, waiting no longer than the given timeout for the reply to the shutdown request.
+        Failures are logged rather than raised, as the reply of an unresponsive server is expected and is not awaited
+        beyond the timeout.
 
-    def _send_shutdown_in_thread(self) -> None:
+        :param timeout: the maximum time, in seconds, to wait for the reply to the shutdown request
+        """
+        try:
+            log.info("Sending shutdown request to server")
+            self.send.shutdown(timeout=timeout)
+            log.info("Received shutdown response from server")
+            log.info("Sending exit notification to server")
+            self.notify.exit()
+            log.info("Sent exit notification to server")
+        except Exception as e:
+            log.debug(f"Shutdown failed: {e}")
+
+    def _send_shutdown_in_thread(self, timeout: float) -> None:
         """
         Signals shutdown to the server in a separate thread (requests can hang),
         and waits for the thread to complete with a timeout.
 
-        :param timeout: timeout, in seconds, to wait for the requests to be handled
+        :param timeout: the maximum time, in seconds, to wait for the shutdown sequence, which in turn waits no longer
+            than this for the reply to the shutdown request
         """
         log.debug("Sending LSP shutdown request...")
-        shutdown_thread = threading.Thread(target=self._send_shutdown)
+        shutdown_thread = threading.Thread(target=self._send_shutdown, args=(timeout,))
         shutdown_thread.daemon = True
         shutdown_thread.start()
-        shutdown_thread.join(timeout=2.0)
+        shutdown_thread.join(timeout=timeout)
         if shutdown_thread.is_alive():
             log.debug("LSP shutdown request timed out, proceeding to terminate...")
         else:
@@ -343,9 +351,12 @@ class LanguageServerInterface(ABC):
                 request.on_error(exception)
             self._pending_requests.clear()
 
-    def _send_request_once(self, method: str, params: dict | None) -> Request.Result:
+    def _send_request_once(self, method: str, params: dict | None, timeout: float | None = None) -> Request.Result:
         """
         Sends a single request to the server (no retries) and waits for its response.
+
+        :param timeout: the maximum time, in seconds, to wait for the response; if None, the interface's request
+            timeout applies
         """
         with self._request_id_lock:
             request_id = self.request_id
@@ -360,11 +371,11 @@ class LanguageServerInterface(ABC):
         self._send_payload(make_request(method, request_id, params))
 
         log.debug("Waiting for response to request %s with params:\n%s", method, params)
-        result = request.get_result(timeout=self._request_timeout)
+        result = request.get_result(timeout=self._request_timeout if timeout is None else timeout)
         log.debug("Completed: %s", request)
         return result
 
-    def send_request(self, method: str, params: dict | None = None) -> PayloadLike:
+    def send_request(self, method: str, params: dict | None = None, timeout: float | None = None) -> PayloadLike:
         """
         Send request to the server, register the request id, and wait for the response.
 
@@ -373,8 +384,11 @@ class LanguageServerInterface(ABC):
         number of times with a short delay instead of being surfaced to the caller immediately;
         see `_CONTENT_MODIFIED_MAX_ATTEMPTS` above. Methods that were not registered are never
         retried, regardless of the error, so as to not retry requests behind the server's back.
+
+        :param timeout: the maximum time, in seconds, to wait for the response; if None, the interface's request
+            timeout applies
         """
-        result = self._send_request_once(method, params)
+        result = self._send_request_once(method, params, timeout)
         if not result.is_error():
             log.debug("Returning result:\n%s", result.payload)
             return result.payload
@@ -386,7 +400,7 @@ class LanguageServerInterface(ABC):
                     break
                 log.info("Request %s got ContentModified (-32801); retrying (%d/%d)", method, attempt, self._content_modified_max_attempts)
                 time.sleep(_CONTENT_MODIFIED_RETRY_DELAY)
-                result = self._send_request_once(method, params)
+                result = self._send_request_once(method, params, timeout)
                 if not result.is_error():
                     log.debug("Returning result:\n%s", result.payload)
                     return result.payload
@@ -560,7 +574,7 @@ class StdioLanguageServer(LanguageServerInterface):
         try:
             # send LSP shutdown and close stdin to signal no more input
             try:
-                self._send_shutdown_in_thread()
+                self._send_shutdown_in_thread(timeout)
                 self._safely_close_pipe(self._process.stdin)
             except Exception as e:
                 log.debug(f"Exception during graceful shutdown: {e}")

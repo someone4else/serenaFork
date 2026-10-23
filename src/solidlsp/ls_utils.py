@@ -480,6 +480,16 @@ class PathUtils:
             return rel_path
         return None
 
+    @staticmethod
+    def traverses_outside_root(relative_path: str) -> bool:
+        """
+        Checks whether a relative path leaves the directory it is relative to by traversing to a parent directory.
+
+        :param relative_path: the relative path to check
+        :return: whether the path contains a '..' component
+        """
+        return ".." in PurePath(relative_path).parts
+
 
 class FileUtils:
     """

@@ -23,7 +23,7 @@ from mcp.server.mcpserver.tools.base import Tool as FastMCPTool
 from mcp.types import ToolAnnotations
 from sensai.util import logging
 
-from serena import __version__ as serena_version_str
+from serena import serena_version
 from serena.agent import (
     SerenaAgent,
 )
@@ -211,6 +211,7 @@ class SerenaMCPFactory:
         - remove 'null' from union type arrays
         - coerce integer-only enums to number
         - best-effort simplify oneOf/anyOf when they only differ by integer/number
+        - state a union of plain scalar types as the list of its member types
         """
         s = deepcopy(schema)
 
@@ -279,7 +280,20 @@ class SerenaMCPFactory:
                     except Exception:
                         pass
                     if not changed:
-                        node[key] = simplified
+                        # a union of plain scalar types is stated as the list of its member types, which is the
+                        # single-type form clients requiring a type entry can read
+                        member_types = [
+                            sub["type"]
+                            for sub in simplified
+                            if isinstance(sub, dict) and isinstance(sub.get("type"), str) and set(sub) <= {"type", "multipleOf"}
+                        ]
+                        if len(member_types) == len(simplified) and len(set(member_types)) > 1 and "null" not in member_types:
+                            node.pop(key, None)
+                            node["type"] = member_types
+                            if "number" in member_types:
+                                node.setdefault("multipleOf", 1)
+                        else:
+                            node[key] = simplified
 
             # ---- recurse into known schema containers ----
             for child_key in ("properties", "patternProperties", "definitions", "$defs"):
@@ -413,7 +427,7 @@ class SerenaMCPFactory:
         log.info("MCP server initial instructions:\n%s", instructions)
         mcp = FastMCP(
             name="Serena",
-            version=serena_version_str,
+            version=serena_version(),
             lifespan=self.server_lifespan,
             website_url="https://oraios.github.io/serena",
             instructions=instructions,

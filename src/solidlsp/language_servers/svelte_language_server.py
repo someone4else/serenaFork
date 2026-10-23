@@ -715,7 +715,7 @@ class SvelteLanguageServer(SolidLanguageServer):
         relative_file_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> list[ls_types.Diagnostic]:
         if _is_ts_file(relative_file_path) and self._ts_server is not None:
             with self._ts_server.open_file(relative_file_path):

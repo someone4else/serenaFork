@@ -671,7 +671,12 @@ class LspApi(FacadeApi):
 
     @facade_method(uses_project_server=True, corresponding_tool=GetDiagnosticsForFileTool)
     def get_diagnostics_for_file(
-        self, relative_path: str, start_line: int = 0, end_line: int = -1, min_severity: int = 4, max_answer_chars: int = -1
+        self,
+        relative_path: str,
+        start_line: int = 0,
+        end_line: int = -1,
+        min_severity: int | str = 4,
+        max_answer_chars: int = -1,
     ) -> LspDiagnostics:
         """
         Gets diagnostics for a file.
@@ -682,8 +687,8 @@ class LspApi(FacadeApi):
         :param relative_path: the relative path to the file to inspect.
         :param start_line: the first 0-based line to include. Defaults to 0.
         :param end_line: the last 0-based line to include. Defaults to -1, which means until the end of the file.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
-            Diagnostics with lower-or-equal numeric severity are returned.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive).
         :return: the grouped diagnostics for the requested file.
         """
         self._get_project().validate_relative_path(relative_path)
@@ -711,7 +716,7 @@ class LspApi(FacadeApi):
         name_path: str,
         reference_file: str = "",
         check_symbol_references: bool = False,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
         max_answer_chars: int = -1,
     ) -> LspDiagnostics:
         """
@@ -723,8 +728,8 @@ class LspApi(FacadeApi):
         :param name_path: the name path of the symbol to inspect.
         :param reference_file: optional file path used to disambiguate the symbol search.
         :param check_symbol_references: whether to additionally collect diagnostics for symbols that reference the symbol.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
-            Diagnostics with lower-or-equal numeric severity are returned.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive).
         :return: the grouped diagnostics for the requested symbol and, optionally, its referencing symbols.
         """
         if reference_file:

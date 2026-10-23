@@ -101,6 +101,7 @@ class Location(TypedDict):
     range: Range
     absolutePath: str
     relativePath: str | None
+    """ the path relative to the repository root, or the absolute path for a file outside all workspace folders """
 
 
 class CompletionItemKind(IntEnum):

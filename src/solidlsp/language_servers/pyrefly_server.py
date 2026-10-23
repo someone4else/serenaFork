@@ -96,11 +96,11 @@ class PyreflyLanguageServer(SolidLanguageServer):
         """
         inner_send_request = self.server.send_request
 
-        def send_request_with_retry(method: str, params: dict | None = None) -> PayloadLike:
+        def send_request_with_retry(method: str, params: dict | None = None, timeout: float | None = None) -> PayloadLike:
             last_exc: SolidLSPException | None = None
             for attempt in range(1, max_retries + 1):
                 try:
-                    return inner_send_request(method, params)
+                    return inner_send_request(method, params, timeout=timeout)
                 except SolidLSPException as e:
                     cause = e.cause
                     if not (isinstance(cause, LSPError) and int(cause.code) in _MUTATION_RETRY_ERROR_CODES):

@@ -286,7 +286,7 @@ class GetDiagnosticsForFileTool(Tool, ToolMarkerSymbolicRead, LspApiMixin):
         relative_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
         max_answer_chars: int = -1,
     ) -> str:
         """
@@ -296,8 +296,8 @@ class GetDiagnosticsForFileTool(Tool, ToolMarkerSymbolicRead, LspApiMixin):
         :param relative_path: the relative path to the file to inspect.
         :param start_line: the first 0-based line to include. Defaults to 0.
         :param end_line: the last 0-based line to include. Defaults to -1, which means until the end of the file.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
-            Diagnostics with lower-or-equal numeric severity are returned.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive, e.g. `Warning`).
         :param max_answer_chars: max result length; -1 for default
         :return: grouped diagnostics for the requested file.
         """
@@ -320,7 +320,7 @@ class GetDiagnosticsForSymbolTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOption
         name_path: str,
         reference_file: str = "",
         check_symbol_references: bool = False,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
         max_answer_chars: int = -1,
     ) -> str:
         """
@@ -331,8 +331,8 @@ class GetDiagnosticsForSymbolTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOption
         :param name_path: the name path of the symbol to inspect.
         :param reference_file: optional file path used to disambiguate the symbol search.
         :param check_symbol_references: whether to additionally collect diagnostics for symbols that reference the symbol.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
-            Diagnostics with lower-or-equal numeric severity are returned.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive, e.g. `Warning`).
         :param max_answer_chars: max result length; -1 for default
         :return: grouped diagnostics for the requested symbol and, optionally, its referencing symbols.
         """

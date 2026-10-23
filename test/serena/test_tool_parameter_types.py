@@ -4,7 +4,9 @@ import pytest
 
 from serena.config.serena_config import SerenaConfig
 from serena.mcp import SerenaMCPFactory
-from serena.tools.tools_base import ToolRegistry
+from serena.tools.symbol_tools import GetDiagnosticsForFileTool, GetDiagnosticsForSymbolTool
+from serena.tools.tools_base import Tool, ToolRegistry
+from solidlsp.ls_diagnostic_severity import DiagnosticSeverityThreshold
 
 
 @pytest.mark.parametrize("context", ("chatgpt", "codex", "oaicompat-agent"))
@@ -37,3 +39,22 @@ def test_all_tool_parameters_have_type(context):
                     issues.append(f"Tool {tool.get_name()!r} parameter {pname!r} missing 'type'")
         if issues:
             raise AssertionError("\n".join(issues))
+
+
+@pytest.mark.parametrize(
+    "tool_class, required_arguments",
+    [
+        (GetDiagnosticsForFileTool, {"relative_path": "module.py"}),
+        (GetDiagnosticsForSymbolTool, {"name_path": "module/function"}),
+    ],
+)
+def test_diagnostics_tool_accepts_a_severity_name(tool_class: type[Tool], required_arguments: dict[str, str]) -> None:
+    """A diagnostics request states the severity threshold either by its LSP code or by its name, both denoting
+    the same threshold.
+    """
+    arguments_model = tool_class.get_apply_fn_metadata_from_cls().arg_model
+
+    by_name = arguments_model.model_validate(required_arguments | {"min_severity": "Warning"}).model_dump()
+    by_code = arguments_model.model_validate(required_arguments | {"min_severity": 2}).model_dump()
+
+    assert DiagnosticSeverityThreshold.parse(by_name["min_severity"]) == DiagnosticSeverityThreshold.parse(by_code["min_severity"])

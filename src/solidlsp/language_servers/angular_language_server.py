@@ -871,7 +871,7 @@ class AngularLanguageServer(SolidLanguageServer):
         relative_file_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> list[ls_types.Diagnostic] | None:
         if self._ts_server is not None and self._is_typescript_file(relative_file_path):
             return self._ts_server.get_cached_published_text_document_diagnostics(
@@ -889,7 +889,7 @@ class AngularLanguageServer(SolidLanguageServer):
         timeout: float = 2.5,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
         allow_cached: bool = True,
     ) -> list[ls_types.Diagnostic] | None:
         # ngserver publishes for .html templates, and for a .ts file whose *inline* template has an
@@ -924,7 +924,7 @@ class AngularLanguageServer(SolidLanguageServer):
         relative_file_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> list[ls_types.Diagnostic]:
         # ngserver does not handle pull diagnostics for .ts files in the way tsserver
         # does — it produces template diagnostics on .html attached via templateUrl,

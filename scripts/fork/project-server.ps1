@@ -38,7 +38,9 @@ param(
     [string]$TaskName = 'SerenaProjectServer',
     [int]$StartTimeoutSeconds = 120,
     # time granted to a graceful shutdown (saving large symbol caches can take a while) before the process is killed
-    [int]$ShutdownTimeoutSeconds = 180
+    [int]$ShutdownTimeoutSeconds = 180,
+    # number of previous runs' console logs to keep; the server's output redirection truncates these files at start
+    [int]$LogBackups = 3
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,10 +84,11 @@ function Invoke-Heartbeat {
         $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/heartbeat" -Headers $headers -UseBasicParsing -TimeoutSec 5
         return [pscustomobject]@{ Code = [int]$response.StatusCode; Body = $response.Content }
     }
-    catch [System.Net.WebException] {
-        if ($_.Exception.Response) {
-            return [pscustomobject]@{ Code = [int]$_.Exception.Response.StatusCode; Body = '' }
-        }
+    catch {
+        # a rejection carries a response; the exception type differs between Windows PowerShell and PowerShell 7,
+        # so both are handled through the response the exception may hold
+        $response = $_.Exception.Response
+        if ($response) { return [pscustomobject]@{ Code = [int]$response.StatusCode; Body = '' } }
         return [pscustomobject]@{ Code = 0; Body = $_.Exception.Message }
     }
 }
@@ -155,6 +158,18 @@ function Get-ServerArguments {
     return , $arguments
 }
 
+# Shifts a run's console log into a numbered backup so that the start of the next run, which redirects into the same
+# file, does not destroy the log of a crash. Empty files are not rotated: they carry nothing to diagnose.
+function Rotate-LogFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if ((Get-Item -LiteralPath $Path).Length -eq 0) { return }
+    for ($index = $LogBackups - 1; $index -ge 1; $index--) {
+        $older = "$Path.$index"
+        if (Test-Path -LiteralPath $older) { Move-Item -LiteralPath $older -Destination "$Path.$($index + 1)" -Force }
+    }
+    Move-Item -LiteralPath $Path -Destination "$Path.1" -Force
+}
+
 function Invoke-Start {
     $server = Get-ListeningServer
     if ($server) {
@@ -175,6 +190,11 @@ function Invoke-Start {
     $serverCommand = (@($SerenaExe) + $serverArguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $outLog = Join-Path $logDir 'project-server-console.out.log'
     $errLog = Join-Path $logDir 'project-server-console.err.log'
+
+    # keep the logs of the previous runs, whose content the redirection below would otherwise truncate
+    Rotate-LogFile $errLog
+    Rotate-LogFile $outLog
+
     $cmdArguments = '/d /s /c "' + $serverCommand + ' > "' + $outLog + '" 2> "' + $errLog + '""'
     $process = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdArguments -WindowStyle Hidden -PassThru
     # keeps the process handle, without which the exit code of an early exit is not available

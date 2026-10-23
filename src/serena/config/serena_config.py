@@ -131,7 +131,23 @@ class SerenaPaths:
         :param prefix: the filename prefix indicating the type of the log file
         :return: the full path to the log file to use
         """
-        log_dir = os.path.join(self.serena_user_home_dir, "logs", datetime.now().strftime("%Y-%m-%d"))
+        from serena.log_retention import LogRetention
+
+        logs_root = os.path.join(self.serena_user_home_dir, "logs")
+
+        # keep the number of daily log directories bounded; this is the point at which the directories are created,
+        # so every session that writes a log file applies the retention
+        retention = LogRetention()
+        removed_directory_names = retention.prune(logs_root)
+        if removed_directory_names:
+            log.info(
+                "Removed %d log directories of days older than %d days from %s",
+                len(removed_directory_names),
+                retention.days,
+                logs_root,
+            )
+
+        log_dir = os.path.join(logs_root, datetime.now().strftime("%Y-%m-%d"))
         os.makedirs(log_dir, exist_ok=True)
         self.last_returned_log_file_path = os.path.join(log_dir, prefix + "_" + datetime_tag() + f"_{os.getpid()}" + ".txt")
         return self.last_returned_log_file_path

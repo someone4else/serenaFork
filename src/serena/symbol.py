@@ -985,7 +985,7 @@ class LanguageServerSymbolRetriever:
         relative_file_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> list[ls_types.Diagnostic]:
         """
         Get diagnostics for a file, optionally restricted to a line range and minimum severity.
@@ -993,7 +993,8 @@ class LanguageServerSymbolRetriever:
         :param relative_file_path: the relative path to the file.
         :param start_line: the first 0-based line to include.
         :param end_line: the last 0-based line to include. `-1` means until end of file.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive).
         :return: the diagnostics matching the requested constraints.
         """
         lang_server = self.get_language_server(relative_file_path)
@@ -1041,7 +1042,7 @@ class LanguageServerSymbolRetriever:
             return None
         return self._normalize_symbol_for_diagnostics(LanguageServerSymbol(symbol_dict))
 
-    def _get_diagnostics_for_symbol(self, symbol: LanguageServerSymbol, min_severity: int) -> list[ls_types.Diagnostic]:
+    def _get_diagnostics_for_symbol(self, symbol: LanguageServerSymbol, min_severity: int | str) -> list[ls_types.Diagnostic]:
         relative_path = symbol.relative_path
         if relative_path is None:
             return []
@@ -1066,7 +1067,7 @@ class LanguageServerSymbolRetriever:
         name_path: str,
         reference_file: str | None = None,
         check_symbol_references: bool = False,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> dict[LanguageServerSymbol, list[ls_types.Diagnostic]]:
         """
         Get diagnostics for the specified symbol and, optionally, for all symbols that reference it.
@@ -1074,7 +1075,8 @@ class LanguageServerSymbolRetriever:
         :param name_path: the name path of the symbol to find. It should usually be unique.
         :param reference_file: optional file path used to disambiguate the symbol search.
         :param check_symbol_references: whether to additionally collect diagnostics for referencing symbols.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive).
         :return: a mapping from symbols to the diagnostics that overlap their body ranges.
         """
         symbol = self.find_unique(name_path, substring_matching=False, within_relative_path=reference_file or None)
@@ -1088,14 +1090,15 @@ class LanguageServerSymbolRetriever:
         self,
         symbol_location: LanguageServerSymbolLocation,
         check_symbol_references: bool = False,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> dict[LanguageServerSymbol, list[ls_types.Diagnostic]]:
         """
         Get diagnostics for the symbol at the given location and, optionally, for all referencing symbols.
 
         :param symbol_location: location of the symbol to inspect.
         :param check_symbol_references: whether to additionally collect diagnostics for referencing symbols.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive).
         :return: an ordered mapping from symbols to the diagnostics that overlap their body ranges.
         """
         if not symbol_location.has_position_in_file():

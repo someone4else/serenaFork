@@ -34,7 +34,9 @@ from solidlsp.dependency_provider import (
 )
 from solidlsp.initialize_params import DefaultInitializeParamsBuilder, InitializeParamsBuilder
 from solidlsp.ls_config import FilenameMatcher, LanguageServerConfig
+from solidlsp.ls_diagnostic_severity import DiagnosticSeverityThreshold
 from solidlsp.ls_exceptions import InvalidTextLocationError, SolidLSPException
+from solidlsp.ls_location_paths import LocationFilePath
 from solidlsp.ls_process import DEFAULT_LS_REQUEST_TIMEOUT, LanguageServerInterface, StdioLanguageServer
 from solidlsp.ls_types import UnifiedSymbolInformation
 from solidlsp.ls_utils import FileUtils, PathUtils, TextUtils
@@ -810,11 +812,8 @@ class SolidLanguageServer(ABC):
         return lo <= end_line and hi >= start_line
 
     @staticmethod
-    def _diagnostic_matches_min_severity(diagnostic: ls_types.Diagnostic, min_severity: int) -> bool:
-        severity = diagnostic.get("severity")
-        if severity is None:
-            return True
-        return int(severity) <= min_severity
+    def _diagnostic_matches_min_severity(diagnostic: ls_types.Diagnostic, min_severity: DiagnosticSeverityThreshold) -> bool:
+        return min_severity.admits(diagnostic.get("severity"))
 
     @classmethod
     def _filter_diagnostics(
@@ -822,10 +821,12 @@ class SolidLanguageServer(ABC):
         diagnostics: list[ls_types.Diagnostic],
         start_line: int,
         end_line: int,
-        min_severity: int,
+        min_severity: int | str,
     ) -> list[ls_types.Diagnostic]:
+        threshold = DiagnosticSeverityThreshold.parse(min_severity)
+
         diagnostics = [d for d in diagnostics if cls._diagnostic_matches_range(d, start_line, end_line)]
-        diagnostics = [d for d in diagnostics if cls._diagnostic_matches_min_severity(d, min_severity)]
+        diagnostics = [d for d in diagnostics if cls._diagnostic_matches_min_severity(d, threshold)]
         return diagnostics
 
     def _validate_text_document_diagnostics_request(
@@ -833,7 +834,7 @@ class SolidLanguageServer(ABC):
         relative_file_path: str,
         start_line: int,
         end_line: int,
-        min_severity: int,
+        min_severity: int | str,
     ) -> str:
         if not self.server_started:
             log.error("request_text_document_diagnostics called before Language Server started")
@@ -842,8 +843,10 @@ class SolidLanguageServer(ABC):
             raise ValueError(f"start_line must be non-negative, got {start_line}")
         if end_line != -1 and end_line < start_line:
             raise ValueError(f"end_line must be -1 or >= start_line, got {end_line} < {start_line}")
-        if min_severity not in {1, 2, 3, 4}:
-            raise ValueError(f"min_severity must be one of 1, 2, 3, 4, got {min_severity}")
+
+        # reject a severity threshold that denotes no LSP severity before any request is made
+        DiagnosticSeverityThreshold.parse(min_severity)
+
         return pathlib.Path(str(PurePath(self.repository_root_path, relative_file_path))).as_uri()
 
     def get_published_diagnostics_generation(self, relative_file_path: str) -> int:
@@ -861,7 +864,7 @@ class SolidLanguageServer(ABC):
         relative_file_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> list[ls_types.Diagnostic] | None:
         """
         Get cached diagnostics received through ``textDocument/publishDiagnostics``.
@@ -869,8 +872,9 @@ class SolidLanguageServer(ABC):
         :param relative_file_path: The relative path of the file to retrieve diagnostics for.
         :param start_line: the first 0-based line to include in the result.
         :param end_line: the last 0-based line to include in the result. ``-1`` means no upper bound.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
-            Diagnostics with lower-or-equal numeric severity are returned.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive). Diagnostics of
+            an equal or more severe severity are returned.
         :return: the cached diagnostics, or ``None`` if no diagnostics were published yet.
         """
         uri = self._validate_text_document_diagnostics_request(relative_file_path, start_line, end_line, min_severity)
@@ -886,7 +890,7 @@ class SolidLanguageServer(ABC):
         timeout: float = 2.5,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
         allow_cached: bool = True,
     ) -> list[ls_types.Diagnostic] | None:
         """
@@ -897,8 +901,9 @@ class SolidLanguageServer(ABC):
         :param timeout: the maximum time to wait for a newer publication.
         :param start_line: the first 0-based line to include in the result.
         :param end_line: the last 0-based line to include in the result. ``-1`` means no upper bound.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
-            Diagnostics with lower-or-equal numeric severity are returned.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive). Diagnostics of
+            an equal or more severe severity are returned.
         :param allow_cached: whether to fall back to the current cached diagnostics if no newer publication arrives in time.
         :return: the published diagnostics, or ``None`` if no diagnostics are available.
         """
@@ -989,7 +994,7 @@ class SolidLanguageServer(ABC):
         relative_file_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> list[ls_types.Diagnostic]:
         """
         Raise a [textDocument/diagnostic](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_diagnostic) request to the Language Server
@@ -998,8 +1003,9 @@ class SolidLanguageServer(ABC):
         :param relative_file_path: The relative path of the file to retrieve diagnostics for
         :param start_line: the first 0-based line to include in the result.
         :param end_line: the last 0-based line to include in the result. `-1` means no upper bound.
-        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
-            Diagnostics with lower-or-equal numeric severity are returned.
+        :param min_severity: the least severe diagnostic severity to include, stated either by its numeric LSP
+            code (1=Error, 2=Warning, 3=Information, 4=Hint) or by its name (case-insensitive). Diagnostics of
+            an equal or more severe severity are returned.
 
         :return: A list of diagnostics for the file
         """
@@ -1086,7 +1092,7 @@ class SolidLanguageServer(ABC):
     @staticmethod
     def _path_contains_dots(relative_file_path: str) -> bool:
         """Check if a relative path traverses outside the workspace root via '..' components."""
-        return ".." in PurePath(relative_file_path).parts
+        return PathUtils.traverses_outside_root(relative_file_path)
 
     @dataclass
     class PathWorkspaceStatus:
@@ -1638,16 +1644,11 @@ class SolidLanguageServer(ABC):
                 raise AssertionError(f"Unexpected response from Language Server: {item}")
 
             abs_path = PathUtils.uri_to_path(uri)
-            rel_path_str = PathUtils.get_relative_path(abs_path, self.language_server.repository_root_path)
 
-            if rel_path_str is None:
-                log.warning(
-                    "Found a %s in a path outside the repository, probably the LS is parsing things in installed packages or in the standardlib! "
-                    "Path: %s. This is a bug but we currently simply skip these locations.",
-                    self.request_name,
-                    abs_path,
-                )
-                return None
+            # the path form under which the location addresses the file (see `LocationFilePath`)
+            file_path = LocationFilePath.from_abs_path(
+                abs_path, self.language_server.repository_root_path, self.language_server._abs_workspace_folders_all
+            )
 
             # skip locations of generated files that are not present on disk
             # (language servers may report e.g. compiled classes under build output)
@@ -1655,11 +1656,12 @@ class SolidLanguageServer(ABC):
                 log.info("%s found symbol at non-existent path: %s", self.request_name, abs_path)
                 return None
 
-            if self.skip_ignored_paths and self.language_server.is_ignored_path(rel_path_str):
-                log.info("%s found symbol in ignored path: %s", self.request_name, rel_path_str)
+            # ignore patterns describe the project's own files, so they do not apply to files outside the workspaces
+            if self.skip_ignored_paths and file_path.is_in_workspace_folder and self.language_server.is_ignored_path(file_path.path):
+                log.info("%s found symbol in ignored path: %s", self.request_name, file_path.path)
                 return None
 
-            return ls_types.Location(uri=uri, range=range_d, absolutePath=str(abs_path), relativePath=rel_path_str)
+            return ls_types.Location(uri=uri, range=range_d, absolutePath=abs_path, relativePath=file_path.path)
 
         def log_perf_result(self, t0: float, result: list[ls_types.Location]) -> None:
             return

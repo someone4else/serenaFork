@@ -345,7 +345,7 @@ class SolidityLanguageServer(SolidLanguageServer):
         relative_file_path: str,
         start_line: int = 0,
         end_line: int = -1,
-        min_severity: int = 4,
+        min_severity: int | str = 4,
     ) -> list[ls_types.Diagnostic]:
         self._validate_text_document_diagnostics_request(relative_file_path, start_line, end_line, min_severity)
         uri = self._get_validation_document_uri(relative_file_path)

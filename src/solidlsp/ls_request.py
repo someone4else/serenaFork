@@ -12,8 +12,14 @@ class LanguageServerRequest:
     def __init__(self, handler: "LanguageServerInterface"):
         self.handler = handler
 
-    def _send_request(self, method: str, params: Any | None = None) -> Any:
-        return self.handler.send_request(method, params)
+    def _send_request(self, method: str, params: Any | None = None, timeout: float | None = None) -> Any:
+        """
+        Sends the request to the language server and returns its result.
+
+        :param timeout: the maximum time, in seconds, to wait for the server's response; if None, the timeout
+            configured for the language server interface applies
+        """
+        return self.handler.send_request(method, params, timeout=timeout)
 
     def implementation(self, params: lsp_types.ImplementationParams) -> Union["lsp_types.Definition", list["lsp_types.LocationLink"], None]:
         """A request to resolve the implementation locations of a symbol at a given text
@@ -220,13 +226,16 @@ class LanguageServerRequest:
         """
         return self._send_request("initialize", params)
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """A shutdown request is sent from the client to the server.
         It is sent once when the client decides to shutdown the
         server. The only notification that is sent after a shutdown request
         is the exit event.
+
+        :param timeout: the maximum time, in seconds, to wait for the server's response; if None, the timeout
+            configured for the language server interface applies
         """
-        return self._send_request("shutdown")
+        return self._send_request("shutdown", timeout=timeout)
 
     def will_save_wait_until(self, params: lsp_types.WillSaveTextDocumentParams) -> list["lsp_types.TextEdit"] | None:
         """A document will save request is sent from the client to the server before
